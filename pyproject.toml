@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agy-chats"
+version = "0.1.0"
+description = "Interactive Terminal User Interface (TUI) to browse, inspect, and resume previous Google Antigravity (agy) conversations"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Vaibhav Singh Shekhawat", email = "vaibhavshekhawatvb@gmail.com" }
+]
+keywords = ["antigravity", "agy", "tui", "history", "gemini", "cli"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console :: Curses",
+]
+
+[project.scripts]
+agy-chats = "agy_chats:main"
+agy-history = "agy_chats:main"
