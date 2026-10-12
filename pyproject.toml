@@ -27,4 +27,5 @@ classifiers = [
 
 [project.scripts]
 agy-chats = "agy_chats:main"
+agy-fork = "agy_chats:main"
 agy-history = "agy_chats:main"

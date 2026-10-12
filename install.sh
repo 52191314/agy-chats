@@ -4,21 +4,23 @@ set -e
 INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "${INSTALL_DIR}"
 
-SCRIPT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agy-chats"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "${SCRIPT_SRC}" ]; then
-  echo "Error: Cannot find agy-chats script at ${SCRIPT_SRC}"
+if [ ! -f "${REPO_DIR}/agy-chats" ] || [ ! -f "${REPO_DIR}/agy-fork" ]; then
+  echo "Error: Cannot find agy-chats and agy-fork scripts at ${REPO_DIR}"
   exit 1
 fi
 
-chmod +x "${SCRIPT_SRC}"
+chmod +x "${REPO_DIR}/agy-chats" "${REPO_DIR}/agy-fork"
 
 # Link or copy to ~/.local/bin
-ln -sf "${SCRIPT_SRC}" "${INSTALL_DIR}/agy-chats"
-ln -sf "${SCRIPT_SRC}" "${INSTALL_DIR}/agy-history"
+ln -sf "${REPO_DIR}/agy-chats" "${INSTALL_DIR}/agy-chats"
+ln -sf "${REPO_DIR}/agy-chats" "${INSTALL_DIR}/agy-history"
+ln -sf "${REPO_DIR}/agy-fork"  "${INSTALL_DIR}/agy-fork"
 
-echo "✓ Successfully installed:"
+echo "✓ Successfully installed unified suite into ${INSTALL_DIR}:"
 echo "  - ${INSTALL_DIR}/agy-chats"
+echo "  - ${INSTALL_DIR}/agy-fork"
 echo "  - ${INSTALL_DIR}/agy-history"
 
 # Check PATH
@@ -31,10 +33,3 @@ case ":$PATH:" in
     echo '  export PATH="$HOME/.local/bin:$PATH"'
     ;;
 esac
-
-# Optional dependency check
-if ! command -v fzf &>/dev/null; then
-  echo ""
-  echo "Tip: Install 'fzf' for interactive fuzzy searching with live preview."
-  echo "     (Falls back to native curses TUI if fzf is not installed)"
-fi
