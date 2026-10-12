@@ -22,7 +22,7 @@ import json
 import sqlite3
 import subprocess
 import shutil
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 
 from rich.console import Console
 from rich.table import Table
@@ -846,7 +846,101 @@ def build_conversation_preview_lines(cid: str, row_data: Tuple, max_width: int =
     t_cli.append(f"agy --conversation {cid}", style="bold cyan")
     lines.append(t_cli)
 
-    return lines
+    return wrap_text_lines(lines, max_width)
+
+
+def wrap_text_lines(raw_lines: List[Text], max_w: int) -> List[Text]:
+    """Ensures no Text line exceeds max_w so Rich never wraps inside Panel and causes viewport overflow."""
+    wrapped: List[Text] = []
+    for line in raw_lines:
+        if len(line.plain) <= max_w:
+            wrapped.append(line)
+        else:
+            try:
+                w_parts = list(line.wrap(console, max_w))
+                if w_parts:
+                    wrapped.extend(w_parts)
+                else:
+                    wrapped.append(line)
+            except Exception:
+                plain = line.plain
+                for i in range(0, len(plain), max_w):
+                    wrapped.append(line.slice(i, min(len(plain), i + max_w)))
+    return wrapped
+
+
+def normalize_dir(ws_uris: Optional[str]) -> Tuple[str, str]:
+    """Normalizes workspace uris to (clean_label, full_path)."""
+    if not ws_uris:
+        return ("(No Workspace)", "~")
+    try:
+        import urllib.parse
+        uris = json.loads(ws_uris)
+        if not uris:
+            return ("(No Workspace)", "~")
+        raw = uris[0].replace("file://", "")
+        raw = urllib.parse.unquote(raw)
+        if sys.platform == "win32" and raw.startswith("/"):
+            if len(raw) >= 3 and raw[2] == ":":
+                raw = raw[1:]
+        raw = raw.replace("\\", "/").rstrip("/")
+        home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+        if raw.lower() == home.lower():
+            return ("~ (Home)", raw)
+        base = os.path.basename(raw)
+        return (base or raw, raw)
+    except Exception:
+        return ("(No Workspace)", "~")
+
+
+def build_directory_preview_lines(dir_name: str, dir_path: str, rows_in_dir: List[Any], max_width: int = 65) -> List[Text]:
+    """Builds a rich overview preview for a selected directory in grouped mode."""
+    lines: List[Text] = []
+    box_w = max(10, min(max_width - 4, len(dir_name) + 6))
+    lines.append(Text("╭" + "─" * box_w + "╮", style="bold yellow"))
+    lines.append(Text(f"│ 📂 {dir_name:<{box_w - 4}} │", style="bold yellow"))
+    lines.append(Text("╰" + "─" * box_w + "╯", style="bold yellow"))
+    lines.append(Text(""))
+
+    lines.append(Text("Workspace Path: ", style="bold") + Text(dir_path or "(Default / Unset)", style="cyan"))
+    lines.append(Text("Total Sessions: ", style="bold") + Text(str(len(rows_in_dir)), style="bold green"))
+
+    total_steps = sum(r[3] for r in rows_in_dir if len(r) > 3 and r[3])
+    lines.append(Text("Total Steps:    ", style="bold") + Text(str(total_steps), style="bold magenta"))
+
+    if rows_in_dir:
+        latest = rows_in_dir[0]
+        dt = parse_time(latest[4])
+        lines.append(Text("Last Active:    ", style="bold") + Text(format_relative(dt), style="yellow"))
+    lines.append(Text(""))
+
+    lines.append(Text("─" * min(max_width, 60), style="dim"))
+    lines.append(Text(f"Sessions in '{dir_name}':", style="bold white"))
+    lines.append(Text(""))
+
+    for idx, r in enumerate(rows_in_dir[:15]):
+        cid = r[0]
+        title = r[1]
+        prev = r[2]
+        last_mod = r[4]
+        dt = parse_time(last_mod)
+        rel = format_relative(dt)
+        eff_title = (title or "").strip()
+        if not eff_title:
+            eff_title = (prev or "").strip().splitlines()[0][:28] if prev else "(Untitled)"
+        t_row = Text(f"  {idx+1:2d}. ", style="dim")
+        t_row.append(f"{cid[:8]} ", style="cyan")
+        t_row.append(f"{eff_title[:26]:<26} ", style="white")
+        t_row.append(f"({rel})", style="dim")
+        lines.append(t_row)
+
+    if len(rows_in_dir) > 15:
+        lines.append(Text(f"  ... and {len(rows_in_dir) - 15} more sessions", style="dim italic"))
+
+    lines.append(Text(""))
+    lines.append(Text("─" * min(max_width, 60), style="dim"))
+    lines.append(Text("Press [Space] or [Enter] to Expand / Collapse this folder.", style="bold cyan"))
+    return wrap_text_lines(lines, max_width)
 
 
 # ==============================================================================
@@ -859,25 +953,34 @@ class MainChatsTUI:
         show_all: bool = False,
         initial_query: str = "",
         default_action: str = "resume",
-        target_turn: Optional[int] = None
+        target_turn: Optional[int] = None,
+        limit: int = 0,
+        group_by_dir: bool = False
     ):
         self.show_all = show_all
         self.filter_query = initial_query.strip()
         self.default_action = default_action
         self.target_turn = target_turn
+        self.limit_count = max(0, limit)
+        self.group_by_dir = group_by_dir
+        self.expanded_dirs: Set[str] = set()
+        self.tree_items: List[Dict[str, Any]] = []
+        self.tree_cursor: int = 0
         self.rows = []
         self.visible_indices = []
         self.selected_idx = 0
         self.page_size = 14
         self.preview_scroll_offset = 0
         self.preview_cache = {}
-        self.scroll_mode = False
+        self.dir_preview_cache = {}
+        self.active_focus: str = "preview"  # Default to preview scrolling!
         self.refresh_data()
 
     def refresh_data(self):
         if not os.path.exists(DEFAULT_SUMMARIES_DB):
             self.rows = []
             self.visible_indices = []
+            self.tree_items = []
             return
         conn = sqlite3.connect(DEFAULT_SUMMARIES_DB)
         cur = conn.cursor()
@@ -894,8 +997,14 @@ class MainChatsTUI:
                 FROM conversation_summaries WHERE nesting_depth = 0 AND step_count > 0
                 ORDER BY last_modified_time DESC
             """)
-        self.rows = cur.fetchall()
+        all_db_rows = cur.fetchall()
         conn.close()
+
+        if self.limit_count > 0:
+            self.rows = all_db_rows[:self.limit_count]
+        else:
+            self.rows = all_db_rows
+
         self.update_filter(self.filter_query)
 
     def update_filter(self, query: str):
@@ -919,6 +1028,94 @@ class MainChatsTUI:
         else:
             self.selected_idx = 0
 
+        self.rebuild_tree()
+
+    def rebuild_tree(self):
+        """Builds directory hierarchy items when grouped by directory."""
+        if not self.group_by_dir:
+            self.tree_items = []
+            return
+
+        groups: Dict[str, Dict[str, Any]] = {}
+        for idx in self.visible_indices:
+            r = self.rows[idx]
+            dir_label, dir_path = normalize_dir(r[5])
+            if dir_label not in groups:
+                groups[dir_label] = {
+                    "dir_key": dir_label,
+                    "dir_path": dir_path,
+                    "rows": [],
+                    "latest_mod": r[4] or ""
+                }
+            groups[dir_label]["rows"].append((idx, r))
+
+        sorted_groups = sorted(
+            groups.values(),
+            key=lambda g: g["latest_mod"],
+            reverse=True
+        )
+
+        # On initial grouping, expand all directories by default
+        if not self.expanded_dirs:
+            for g in sorted_groups:
+                self.expanded_dirs.add(g["dir_key"])
+
+        self.tree_items = []
+        for g in sorted_groups:
+            d_key = g["dir_key"]
+            is_expanded = (d_key in self.expanded_dirs)
+            self.tree_items.append({
+                "type": "dir",
+                "dir_key": d_key,
+                "dir_path": g["dir_path"],
+                "count": len(g["rows"]),
+                "rows": [r for _, r in g["rows"]],
+                "expanded": is_expanded
+            })
+            if is_expanded:
+                for orig_idx, r in g["rows"]:
+                    self.tree_items.append({
+                        "type": "session",
+                        "dir_key": d_key,
+                        "row_idx": orig_idx,
+                        "row": r
+                    })
+
+        if self.tree_items:
+            self.tree_cursor = min(self.tree_cursor, len(self.tree_items) - 1)
+        else:
+            self.tree_cursor = 0
+
+    def set_custom_limit(self):
+        console.print()
+        curr_str = str(self.limit_count) if self.limit_count > 0 else "All"
+        val = prompt_input(f"Enter custom number of sessions to display (0 for all) [Current: {curr_str}]:")
+        val = val.strip()
+        if not val:
+            return
+        try:
+            num = int(val)
+            self.limit_count = max(0, num)
+            self.preview_cache.clear()
+            self.dir_preview_cache.clear()
+            self.preview_scroll_offset = 0
+            self.refresh_data()
+        except ValueError:
+            console.print("[bold red]Invalid number. Limit unchanged.[/bold red]")
+            get_key()
+
+    def _get_selected_cid(self) -> Optional[str]:
+        if self.group_by_dir and self.tree_items:
+            sel_item = self.tree_items[self.tree_cursor]
+            if sel_item["type"] == "session":
+                return sel_item["row"][0]
+            elif sel_item["rows"]:
+                return sel_item["rows"][0][0]
+            return None
+        if self.visible_indices:
+            return self.rows[self.selected_idx][0]
+        return None
+
     def render(self):
         os.system("cls" if os.name == "nt" else "clear")
 
@@ -933,10 +1130,18 @@ class MainChatsTUI:
             header_text.append("Select Session for Edit/Tool Cut\n", style="bold yellow")
         else:
             header_text.append("Antigravity Unified Session Suite (agy-chats)  |  ", style="bold cyan")
-            mode_str = "All Sessions (incl. subagents)" if self.show_all else "Main Chats Only"
+            mode_str = "All (incl. subagents)" if self.show_all else "Main Chats Only"
             header_text.append(f"Mode: {mode_str} ('a' to toggle)\n", style="bold yellow")
 
-        header_text.append(f"Total Sessions: {len(self.rows)}  |  ", style="dim")
+        grp_status = "[bold green]ON[/bold green]" if self.group_by_dir else "[dim]OFF[/dim]"
+        header_text.append(f"Total: {len(self.rows)}  |  ", style="dim")
+        header_text.append(f"Grouped Dirs: {grp_status} ('g')  |  ", style="white")
+
+        if self.limit_count > 0:
+            header_text.append(f"Showing: Top {self.limit_count} ('#' to change)  |  ", style="bold yellow")
+        else:
+            header_text.append("Showing: All ('#' to limit)  |  ", style="dim")
+
         if self.filter_query:
             header_text.append(f"Filter: '{self.filter_query}' ({len(self.visible_indices)} matching)", style="bold magenta")
         else:
@@ -945,71 +1150,156 @@ class MainChatsTUI:
         border_c = "green" if self.default_action == "tool" else "cyan"
         console.print(Panel(header_text, border_style=border_c, box=box.ROUNDED))
 
-        if not self.visible_indices:
+        if not self.visible_indices and not (self.group_by_dir and self.tree_items):
             console.print(Panel(f"[bold red]No conversations matching '{escape(self.filter_query)}'.[/bold red]", border_style="red"))
             self.render_controls()
             return
 
-        if self.selected_idx not in self.visible_indices:
-            self.selected_idx = self.visible_indices[0]
+        # Height budgeted strictly to avoid terminal window vertical overflow
+        avail_h = max(6, term_lines - 10)
+        self.page_size = avail_h
 
-        curr_pos = self.visible_indices.index(self.selected_idx)
-        self.page_size = max(6, min(14, term_lines - 12))
-        start_pos = max(0, curr_pos - self.page_size // 2)
-        end_pos = min(len(self.visible_indices), start_pos + self.page_size)
-        if end_pos - start_pos < self.page_size:
-            start_pos = max(0, end_pos - self.page_size)
-
-        # 1. Left Table: Conversations List
+        # -------------------------------------------------------------
+        # 1. Left Table: Workspaces Tree vs Flat Conversations List
+        # -------------------------------------------------------------
         list_table = Table(box=box.SIMPLE_HEAVY, expand=True)
-        list_table.add_column("", justify="center", width=2)
-        list_table.add_column("ID", style="cyan", width=8)
-        list_table.add_column("Title", style="white", ratio=1)
-        list_table.add_column("Active", justify="center", width=8)
-        list_table.add_column("Steps", justify="right", width=6)
-        list_table.add_column("Dir", style="green", width=9)
 
-        for pos in range(start_pos, end_pos):
-            idx = self.visible_indices[pos]
-            row = self.rows[idx]
-            cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row
-            is_selected = (idx == self.selected_idx)
+        if self.group_by_dir:
+            list_table.add_column("", justify="center", width=2)
+            list_table.add_column("Folder / ID", style="cyan", width=12)
+            list_table.add_column("Workspace / Session Title", style="white", ratio=1)
+            list_table.add_column("Active", justify="center", width=8)
+            list_table.add_column("Steps", justify="right", width=6)
 
-            dt = parse_time(last_mod)
-            rel_time = format_relative(dt)
-            ws_label = get_workspace_label(ws_uris)
-            eff_title = (title or "").strip()
-            if not eff_title:
-                if agent_name: eff_title = f"[{agent_name}]"
-                elif prev: eff_title = prev.strip().splitlines()[0][:35]
-                else: eff_title = "(Untitled Session)"
+            total_tree = len(self.tree_items)
+            self.tree_cursor = max(0, min(self.tree_cursor, total_tree - 1)) if total_tree else 0
+            start_pos = max(0, self.tree_cursor - self.page_size // 2)
+            end_pos = min(total_tree, start_pos + self.page_size)
+            if end_pos - start_pos < self.page_size:
+                start_pos = max(0, end_pos - self.page_size)
 
-            dot = "[magenta]▲[/magenta]" if agent_name else "[green]●[/green]"
-            id_str = f">{cid[:7]}" if is_selected else cid[:8]
-            row_style = "bold white on blue" if is_selected else "none"
+            for pos in range(start_pos, end_pos):
+                item = self.tree_items[pos]
+                is_selected = (pos == self.tree_cursor)
+                row_style = "bold white on blue" if is_selected else "none"
 
-            list_table.add_row(
-                dot,
-                id_str,
-                escape(eff_title[:32]),
-                rel_time[:8],
-                str(step_count),
-                escape(ws_label[:9]),
-                style=row_style
-            )
+                if item["type"] == "dir":
+                    icon = "▼" if item["expanded"] else "▶"
+                    fol_badge = f"{icon} 📂 {item['dir_key'][:10]}"
+                    title_badge = f"{item['count']} sessions  [dim]({item['dir_path'][:25]})[/dim]"
+                    steps_sum = str(sum(r[3] for r in item["rows"] if len(r) > 3 and r[3]))
+                    list_table.add_row(
+                        icon,
+                        fol_badge,
+                        title_badge,
+                        "",
+                        steps_sum,
+                        style="bold yellow on blue" if is_selected else "bold yellow"
+                    )
+                else:
+                    r = item["row"]
+                    cid = r[0]
+                    title = (r[1] or "").strip() or (r[2] or "").strip().splitlines()[0][:30] if r[2] else "(Untitled)"
+                    dt = parse_time(r[4])
+                    rel_time = format_relative(dt)
+                    dot = "[magenta]▲[/magenta]" if r[6] else "[green]●[/green]"
+                    id_str = f" >{cid[:6]}" if is_selected else f"  {cid[:6]}"
+                    list_table.add_row(
+                        dot,
+                        id_str,
+                        escape(f"  {title[:30]}"),
+                        rel_time[:8],
+                        str(r[3]),
+                        style=row_style
+                    )
 
-        left_panel = Panel(list_table, title=f"Conversations ({len(self.visible_indices)})", border_style="cyan", box=box.ROUNDED)
+            left_title = f"Workspaces ({len(self.tree_items)} items)"
+        else:
+            if self.selected_idx not in self.visible_indices:
+                self.selected_idx = self.visible_indices[0] if self.visible_indices else 0
 
-        # 2. Right Pane: Scrollable Live Preview
-        sel_row = self.rows[self.selected_idx]
-        sel_cid = sel_row[0]
+            curr_pos = self.visible_indices.index(self.selected_idx) if self.visible_indices else 0
+            start_pos = max(0, curr_pos - self.page_size // 2)
+            end_pos = min(len(self.visible_indices), start_pos + self.page_size)
+            if end_pos - start_pos < self.page_size:
+                start_pos = max(0, end_pos - self.page_size)
+
+            list_table.add_column("", justify="center", width=2)
+            list_table.add_column("ID", style="cyan", width=8)
+            list_table.add_column("Title", style="white", ratio=1)
+            list_table.add_column("Active", justify="center", width=8)
+            list_table.add_column("Steps", justify="right", width=6)
+            list_table.add_column("Dir", style="green", width=9)
+
+            for pos in range(start_pos, end_pos):
+                idx = self.visible_indices[pos]
+                row = self.rows[idx]
+                cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row
+                is_selected = (idx == self.selected_idx)
+
+                dt = parse_time(last_mod)
+                rel_time = format_relative(dt)
+                ws_label = get_workspace_label(ws_uris)
+                eff_title = (title or "").strip()
+                if not eff_title:
+                    if agent_name: eff_title = f"[{agent_name}]"
+                    elif prev: eff_title = prev.strip().splitlines()[0][:35]
+                    else: eff_title = "(Untitled Session)"
+
+                dot = "[magenta]▲[/magenta]" if agent_name else "[green]●[/green]"
+                id_str = f">{cid[:7]}" if is_selected else cid[:8]
+                row_style = "bold white on blue" if is_selected else "none"
+
+                list_table.add_row(
+                    dot,
+                    id_str,
+                    escape(eff_title[:32]),
+                    rel_time[:8],
+                    str(step_count),
+                    escape(ws_label[:9]),
+                    style=row_style
+                )
+
+            left_title = f"Conversations ({len(self.visible_indices)})"
+
+        if self.active_focus == "list":
+            left_border = "yellow"
+            p_left_title = Text(f"[LIST ACTIVE] {left_title}", style="bold yellow")
+            p_left_sub = Text("Use ▲/▼ to select  |  Tab to focus preview", style="dim cyan")
+        else:
+            left_border = "cyan"
+            p_left_title = Text(left_title, style="bold cyan")
+            p_left_sub = Text("Left/Right switch session  |  Tab for list focus", style="dim")
+
+        left_panel = Panel(list_table, title=p_left_title, subtitle=p_left_sub, border_style=left_border, box=box.ROUNDED)
+
+        # -------------------------------------------------------------
+        # 2. Right Pane: Scrollable Live Preview (Pre-wrapped to fit viewport)
+        # -------------------------------------------------------------
         preview_w = max(40, (term_cols // 2) - 4)
 
-        if sel_cid not in self.preview_cache:
-            self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
-        all_preview_lines = self.preview_cache[sel_cid]
+        if self.group_by_dir and self.tree_items:
+            sel_item = self.tree_items[self.tree_cursor]
+            if sel_item["type"] == "dir":
+                d_key = sel_item["dir_key"]
+                if d_key not in self.dir_preview_cache:
+                    self.dir_preview_cache[d_key] = build_directory_preview_lines(
+                        d_key, sel_item["dir_path"], sel_item["rows"], max_width=preview_w
+                    )
+                all_preview_lines = self.dir_preview_cache[d_key]
+            else:
+                sel_row = sel_item["row"]
+                sel_cid = sel_row[0]
+                if sel_cid not in self.preview_cache:
+                    self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
+                all_preview_lines = self.preview_cache[sel_cid]
+        else:
+            sel_row = self.rows[self.selected_idx]
+            sel_cid = sel_row[0]
+            if sel_cid not in self.preview_cache:
+                self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
+            all_preview_lines = self.preview_cache[sel_cid]
 
-        avail_h = max(6, term_lines - 12)
         max_offset = max(0, len(all_preview_lines) - avail_h)
         self.preview_scroll_offset = max(0, min(self.preview_scroll_offset, max_offset))
 
@@ -1021,22 +1311,33 @@ class MainChatsTUI:
                 preview_content.append("\n")
             preview_content.append_text(line)
 
-        # Scroll Indicators in Preview Panel (Use Text objects to avoid Rich markup tag errors)
+        # Pad preview_content to avail_h lines if fewer lines exist, maintaining fixed height
+        if len(visible_preview) < avail_h:
+            pad_needed = avail_h - len(visible_preview)
+            for _ in range(pad_needed):
+                preview_content.append("\n")
+
+        # Scroll Indicators in Preview Panel
         p_title = Text()
-        p_title.append("Preview", style="bold")
-        if self.preview_scroll_offset > 0:
-            p_title.append(f" (▲ {self.preview_scroll_offset} lines above - K/[ to scroll)", style="bold yellow")
+        if self.active_focus == "preview":
+            p_title.append("[PREVIEW ACTIVE] ", style="bold green")
         else:
-            p_title.append(" Details", style="dim")
+            p_title.append("Preview ", style="bold")
+
+        if self.preview_scroll_offset > 0:
+            p_title.append(f"(▲ {self.preview_scroll_offset} lines above - ▲/k to scroll)", style="bold yellow")
+        else:
+            p_title.append("Details", style="dim")
 
         p_sub = Text()
         remaining_lines = max(0, len(all_preview_lines) - (self.preview_scroll_offset + avail_h))
         if remaining_lines > 0:
-            p_sub.append(f"▼ {remaining_lines} lines below (use J/K or [/] to scroll)", style="bold yellow")
+            p_sub.append(f"▼ {remaining_lines} lines below (use ▲/▼ or j/k to scroll)", style="bold yellow")
         else:
             p_sub.append("(End of Preview)", style="dim")
 
-        right_panel = Panel(preview_content, title=p_title, subtitle=p_sub, border_style="green", box=box.ROUNDED)
+        right_border = "green" if self.active_focus == "preview" else "dim green"
+        right_panel = Panel(preview_content, title=p_title, subtitle=p_sub, border_style=right_border, box=box.ROUNDED)
 
         # Side-by-Side Split Screen Layout
         if term_cols >= 85:
@@ -1053,39 +1354,40 @@ class MainChatsTUI:
 
     def render_controls(self):
         ctrls = Text()
-        if self.scroll_mode:
-            ctrls.append(" [SCROLL MODE] ", style="bold black on yellow")
-            ctrls.append(" [Up/Down or k/j] Scroll Preview  |  [p] Switch to List  |  [q/Esc] Exit", style="bold cyan")
+        if self.active_focus == "preview":
+            ctrls.append(" [PREVIEW] ", style="bold black on green")
+            ctrls.append(" [▲/▼ or j/k] Scroll  |  ", style="bold green")
+            ctrls.append("[◀/▶ or [/]] Switch Session  |  ", style="bold cyan")
+            ctrls.append("[Tab] Focus List  |  ", style="yellow")
         else:
-            ctrls.append(" [Up/Down] Select  |  ", style="bold cyan")
-            ctrls.append("[J/K or [/]] Scroll Preview  |  ", style="bold yellow")
-            if self.default_action == "fork":
-                ctrls.append("[Enter] Fork Turns  |  ", style="bold green")
-                ctrls.append("[T] Tool Cutter  |  ", style="bold yellow")
-                ctrls.append("[r] Resume  |  ", style="cyan")
-            elif self.default_action == "tool":
-                ctrls.append("[Enter] Tool Cutter  |  ", style="bold green")
-                ctrls.append("[f] Fork Turns  |  ", style="bold yellow")
-                ctrls.append("[r] Resume  |  ", style="cyan")
-            else:
-                ctrls.append("[Enter] Resume  |  ", style="bold green")
-                ctrls.append("[f] Fork  |  ", style="bold yellow")
+            ctrls.append(" [LIST] ", style="bold black on yellow")
+            ctrls.append(" [▲/▼] Select  |  ", style="bold yellow")
+            if self.group_by_dir:
+                ctrls.append("[Space/Enter] Expand/Collapse  |  ", style="bold cyan")
+            ctrls.append("[Tab] Focus Preview  |  ", style="green")
 
-            ctrls.append("[m] Move  |  ", style="bold magenta")
-            ctrls.append("[t] Transcript  |  ", style="bold white")
-            ctrls.append("[p] Scroll  |  ", style="dim")
-            ctrls.append("[y] Copy  |  ", style="dim")
-            ctrls.append("[a] Toggle  |  ", style="dim")
-            ctrls.append("[/] Search  |  ", style="dim")
-            ctrls.append("[q/Esc] Quit", style="bold red")
+        ctrls.append("[g] Group Dirs  |  ", style="bold magenta")
+        ctrls.append("[#] Limit  |  ", style="bold yellow")
+        ctrls.append("[Enter] Resume  |  ", style="bold green")
+        ctrls.append("[f] Fork  |  ", style="cyan")
+        ctrls.append("[m] Move  |  ", style="dim")
+        ctrls.append("[t] Trans  |  ", style="dim")
+        ctrls.append("[/] Search  |  ", style="dim")
+        ctrls.append("[q] Quit", style="bold red")
         console.print(ctrls)
 
     def interactive_move(self):
-        if not self.visible_indices: return
-        sel_row = self.rows[self.selected_idx]
-        cid = sel_row[0]
-        title = sel_row[1] or cid[:8]
-        curr_ws = format_workspace_path(sel_row[5])
+        cid = self._get_selected_cid()
+        if not cid: return
+
+        # Lookup title and workspace
+        title = cid[:8]
+        curr_ws = "~"
+        for r in self.rows:
+            if r[0] == cid:
+                title = r[1] or cid[:8]
+                curr_ws = format_workspace_path(r[5])
+                break
 
         os.system("cls" if os.name == "nt" else "clear")
         menu = Text()
@@ -1132,19 +1434,41 @@ class MainChatsTUI:
             self.render()
             k = get_key()
 
-            # Preview scroll keys
+            # Global toggles
+            if k in ("g", "G"):
+                self.group_by_dir = not self.group_by_dir
+                self.rebuild_tree()
+                self.preview_scroll_offset = 0
+                continue
+            elif k in ("#", "N"):
+                self.set_custom_limit()
+                continue
+            elif k in ("TAB",):
+                self.active_focus = "list" if self.active_focus == "preview" else "preview"
+                continue
+            elif k in ("e", "E") and self.group_by_dir:
+                for item in self.tree_items:
+                    if item["type"] == "dir":
+                        self.expanded_dirs.add(item["dir_key"])
+                self.rebuild_tree()
+                continue
+            elif k in ("c", "C") and self.group_by_dir:
+                self.expanded_dirs.clear()
+                self.rebuild_tree()
+                continue
+
+            # Always scroll preview with bracket / shift keys
             if k in ("]", "J"):
                 self.preview_scroll_offset += 3
                 continue
             elif k in ("[", "K"):
                 self.preview_scroll_offset = max(0, self.preview_scroll_offset - 3)
                 continue
-            elif k in ("p", "P"):
-                self.scroll_mode = not self.scroll_mode
-                continue
 
-            # Navigation in scroll mode vs list mode
-            if self.scroll_mode:
+            # -------------------------------------------------------------
+            # PREVIEW FOCUS (Default: Arrow keys & j/k move PREVIEW!)
+            # -------------------------------------------------------------
+            if self.active_focus == "preview":
                 if k in ("UP", "k"):
                     self.preview_scroll_offset = max(0, self.preview_scroll_offset - 2)
                     continue
@@ -1157,42 +1481,146 @@ class MainChatsTUI:
                 elif k == "PAGE_DOWN":
                     self.preview_scroll_offset += 8
                     continue
-                elif k in ("ESC", "q"):
-                    self.scroll_mode = False
+                elif k == "HOME":
+                    self.preview_scroll_offset = 0
+                    continue
+                elif k == "END":
+                    self.preview_scroll_offset = 999999
+                    continue
+                elif k in ("LEFT",):
+                    if self.group_by_dir:
+                        if self.tree_cursor > 0:
+                            self.tree_cursor -= 1
+                            self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            if curr_pos > 0:
+                                self.selected_idx = self.visible_indices[curr_pos - 1]
+                                self.preview_scroll_offset = 0
+                    continue
+                elif k in ("RIGHT",):
+                    if self.group_by_dir:
+                        if self.tree_cursor < len(self.tree_items) - 1:
+                            self.tree_cursor += 1
+                            self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            if curr_pos < len(self.visible_indices) - 1:
+                                self.selected_idx = self.visible_indices[curr_pos + 1]
+                                self.preview_scroll_offset = 0
+                    continue
+                elif k == " ":
+                    if self.group_by_dir and self.tree_items:
+                        sel_item = self.tree_items[self.tree_cursor]
+                        if sel_item["type"] == "dir":
+                            d_key = sel_item["dir_key"]
+                            if d_key in self.expanded_dirs:
+                                self.expanded_dirs.remove(d_key)
+                            else:
+                                self.expanded_dirs.add(d_key)
+                            self.rebuild_tree()
+                            self.preview_scroll_offset = 0
+                            continue
+
+            # -------------------------------------------------------------
+            # LIST FOCUS (When Tab is pressed to navigate items)
+            # -------------------------------------------------------------
+            if self.active_focus == "list":
+                if k in ("UP", "k"):
+                    if self.group_by_dir:
+                        if self.tree_cursor > 0:
+                            self.tree_cursor -= 1
+                            self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            if curr_pos > 0:
+                                self.selected_idx = self.visible_indices[curr_pos - 1]
+                                self.preview_scroll_offset = 0
+                    continue
+                elif k in ("DOWN", "j"):
+                    if self.group_by_dir:
+                        if self.tree_cursor < len(self.tree_items) - 1:
+                            self.tree_cursor += 1
+                            self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            if curr_pos < len(self.visible_indices) - 1:
+                                self.selected_idx = self.visible_indices[curr_pos + 1]
+                                self.preview_scroll_offset = 0
+                    continue
+                elif k == "PAGE_UP":
+                    if self.group_by_dir:
+                        self.tree_cursor = max(0, self.tree_cursor - self.page_size)
+                        self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            self.selected_idx = self.visible_indices[max(0, curr_pos - self.page_size)]
+                            self.preview_scroll_offset = 0
+                    continue
+                elif k == "PAGE_DOWN":
+                    if self.group_by_dir:
+                        self.tree_cursor = min(max(0, len(self.tree_items) - 1), self.tree_cursor + self.page_size)
+                        self.preview_scroll_offset = 0
+                    else:
+                        if self.visible_indices:
+                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            self.selected_idx = self.visible_indices[min(len(self.visible_indices) - 1, curr_pos + self.page_size)]
+                            self.preview_scroll_offset = 0
+                    continue
+                elif k == "HOME":
+                    if self.group_by_dir:
+                        self.tree_cursor = 0
+                    else:
+                        if self.visible_indices:
+                            self.selected_idx = self.visible_indices[0]
+                    self.preview_scroll_offset = 0
+                    continue
+                elif k == "END":
+                    if self.group_by_dir:
+                        self.tree_cursor = max(0, len(self.tree_items) - 1)
+                    else:
+                        if self.visible_indices:
+                            self.selected_idx = self.visible_indices[-1]
+                    self.preview_scroll_offset = 0
+                    continue
+                elif k == " ":
+                    if self.group_by_dir and self.tree_items:
+                        sel_item = self.tree_items[self.tree_cursor]
+                        if sel_item["type"] == "dir":
+                            d_key = sel_item["dir_key"]
+                            if d_key in self.expanded_dirs:
+                                self.expanded_dirs.remove(d_key)
+                            else:
+                                self.expanded_dirs.add(d_key)
+                            self.rebuild_tree()
+                            self.preview_scroll_offset = 0
+                            continue
+                elif k == "LEFT":
+                    if self.group_by_dir and self.tree_items:
+                        sel_item = self.tree_items[self.tree_cursor]
+                        if sel_item["type"] == "dir" and sel_item["dir_key"] in self.expanded_dirs:
+                            self.expanded_dirs.remove(sel_item["dir_key"])
+                            self.rebuild_tree()
+                            self.preview_scroll_offset = 0
+                            continue
+                elif k == "RIGHT":
+                    if self.group_by_dir and self.tree_items:
+                        sel_item = self.tree_items[self.tree_cursor]
+                        if sel_item["type"] == "dir" and sel_item["dir_key"] not in self.expanded_dirs:
+                            self.expanded_dirs.add(sel_item["dir_key"])
+                            self.rebuild_tree()
+                            self.preview_scroll_offset = 0
+                            continue
+                    self.active_focus = "preview"
                     continue
 
-            # Standard list navigation
-            if k in ("UP", "k"):
-                if self.visible_indices:
-                    curr_pos = self.visible_indices.index(self.selected_idx)
-                    if curr_pos > 0:
-                        self.selected_idx = self.visible_indices[curr_pos - 1]
-                        self.preview_scroll_offset = 0
-            elif k in ("DOWN", "j"):
-                if self.visible_indices:
-                    curr_pos = self.visible_indices.index(self.selected_idx)
-                    if curr_pos < len(self.visible_indices) - 1:
-                        self.selected_idx = self.visible_indices[curr_pos + 1]
-                        self.preview_scroll_offset = 0
-            elif k == "PAGE_UP":
-                if self.visible_indices:
-                    curr_pos = self.visible_indices.index(self.selected_idx)
-                    self.selected_idx = self.visible_indices[max(0, curr_pos - self.page_size)]
-                    self.preview_scroll_offset = 0
-            elif k == "PAGE_DOWN":
-                if self.visible_indices:
-                    curr_pos = self.visible_indices.index(self.selected_idx)
-                    self.selected_idx = self.visible_indices[min(len(self.visible_indices) - 1, curr_pos + self.page_size)]
-                    self.preview_scroll_offset = 0
-            elif k == "HOME":
-                if self.visible_indices:
-                    self.selected_idx = self.visible_indices[0]
-                    self.preview_scroll_offset = 0
-            elif k == "END":
-                if self.visible_indices:
-                    self.selected_idx = self.visible_indices[-1]
-                    self.preview_scroll_offset = 0
-            elif k in ("/",):
+            # Global actions
+            if k in ("/",):
                 q = prompt_input("Search (title, UUID, workspace):")
                 self.update_filter(q)
                 self.preview_scroll_offset = 0
@@ -1203,34 +1631,34 @@ class MainChatsTUI:
             elif k in ("m", "M"):
                 self.interactive_move()
             elif k in ("f", "F"):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                cid = self._get_selected_cid()
+                if cid:
                     forker = TurnExplorerTUI(cid)
                     res = forker.run()
                     if res:
                         show_success_screen(res)
                         return
             elif k in ("T",) or (self.default_action == "tool" and k in ("ENTER",)):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                cid = self._get_selected_cid()
+                if cid:
                     cutter = ToolCutterTUI(cid, turn_index=self.target_turn)
                     res = cutter.run()
                     if res:
                         show_success_screen(res)
                         return
             elif k in ("t",):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                cid = self._get_selected_cid()
+                if cid:
                     show_transcript_pager(cid)
             elif k in ("y", "Y"):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                cid = self._get_selected_cid()
+                if cid:
                     copy_to_clipboard(cid)
                     console.print("\n[bold green]Copied UUID to clipboard![/bold green]")
                     get_key()
             elif k in ("r", "R"):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                cid = self._get_selected_cid()
+                if cid:
                     console.print(f"\n[bold green]Resuming conversation [cyan]{cid}[/cyan]...[/bold green]\n")
                     if sys.platform == "win32":
                         subprocess.run(f"agy --conversation {cid}", shell=True)
@@ -1238,8 +1666,20 @@ class MainChatsTUI:
                         os.execvp("agy", ["agy", "--conversation", cid])
                     return
             elif k in ("ENTER",):
-                if self.visible_indices:
-                    cid = self.rows[self.selected_idx][0]
+                if self.group_by_dir and self.tree_items:
+                    sel_item = self.tree_items[self.tree_cursor]
+                    if sel_item["type"] == "dir":
+                        d_key = sel_item["dir_key"]
+                        if d_key in self.expanded_dirs:
+                            self.expanded_dirs.remove(d_key)
+                        else:
+                            self.expanded_dirs.add(d_key)
+                        self.rebuild_tree()
+                        self.preview_scroll_offset = 0
+                        continue
+
+                cid = self._get_selected_cid()
+                if cid:
                     if self.default_action == "fork":
                         forker = TurnExplorerTUI(cid)
                         res = forker.run()

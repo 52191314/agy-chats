@@ -437,6 +437,17 @@ def main():
         action="store_true",
         help="Show all conversations, including subagents and empty sessions."
     )
+    parser.add_argument(
+        "-n", "--limit", "--count",
+        type=int,
+        default=0,
+        help="Limit number of sessions shown (e.g. -n 20, or 0 for all)."
+    )
+    parser.add_argument(
+        "-g", "--group",
+        action="store_true",
+        help="Group sessions by workspace directory with expand/collapse."
+    )
 
     # Surgical / Headless Parameters
     parser.add_argument(
@@ -750,7 +761,13 @@ def main():
         if not target_cid:
             # Launch browser picker in fork or tool mode
             default_act = "tool" if is_tool_mode else "fork"
-            picker = MainChatsTUI(show_all=args.all, default_action=default_act, target_turn=args.turn)
+            picker = MainChatsTUI(
+                show_all=args.all,
+                default_action=default_act,
+                target_turn=args.turn,
+                limit=args.limit,
+                group_by_dir=args.group
+            )
             picker.run()
             return
 
@@ -783,7 +800,13 @@ def main():
         return
 
     initial_q = args.conversation or ""
-    app = MainChatsTUI(show_all=args.all, initial_query=initial_q, default_action="resume")
+    app = MainChatsTUI(
+        show_all=args.all,
+        initial_query=initial_q,
+        default_action="resume",
+        limit=args.limit,
+        group_by_dir=args.group
+    )
     app.run()
 
 
