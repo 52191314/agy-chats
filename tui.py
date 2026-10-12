@@ -310,7 +310,7 @@ class ToolCutterTUI:
             return
 
         if not self.visible_indices:
-            console.print(Panel(f"[bold red]No tools match '{self.filter_query}'.[/bold red]\nPress [bold yellow]'/'[/bold yellow] to change filter or [bold yellow]ESC[/bold yellow] to clear.", border_style="red"))
+            console.print(Panel(f"[bold red]No tools match '{escape(self.filter_query)}'.[/bold red]\nPress [bold yellow]'/'[/bold yellow] to change filter or [bold yellow]ESC[/bold yellow] to clear.", border_style="red"))
             self.render_controls()
             return
 
@@ -946,7 +946,7 @@ class MainChatsTUI:
         console.print(Panel(header_text, border_style=border_c, box=box.ROUNDED))
 
         if not self.visible_indices:
-            console.print(Panel(f"[bold red]No conversations matching '{self.filter_query}'.[/bold red]", border_style="red"))
+            console.print(Panel(f"[bold red]No conversations matching '{escape(self.filter_query)}'.[/bold red]", border_style="red"))
             self.render_controls()
             return
 
@@ -1021,17 +1021,20 @@ class MainChatsTUI:
                 preview_content.append("\n")
             preview_content.append_text(line)
 
-        # Scroll Indicators in Preview Panel
+        # Scroll Indicators in Preview Panel (Use Text objects to avoid Rich markup tag errors)
+        p_title = Text()
+        p_title.append("Preview", style="bold")
         if self.preview_scroll_offset > 0:
-            p_title = f"Preview [bold yellow](▲ {self.preview_scroll_offset} lines above - K/[ to scroll)[/bold yellow]"
+            p_title.append(f" (▲ {self.preview_scroll_offset} lines above - K/[ to scroll)", style="bold yellow")
         else:
-            p_title = "Session Preview"
+            p_title.append(" Details", style="dim")
 
+        p_sub = Text()
         remaining_lines = max(0, len(all_preview_lines) - (self.preview_scroll_offset + avail_h))
         if remaining_lines > 0:
-            p_sub = f"[bold yellow]▼ {remaining_lines} lines below (use J/K or [/] to scroll)[/bold yellow]"
+            p_sub.append(f"▼ {remaining_lines} lines below (use J/K or [/] to scroll)", style="bold yellow")
         else:
-            p_sub = "[dim](End of Preview)[/dim]"
+            p_sub.append("(End of Preview)", style="dim")
 
         right_panel = Panel(preview_content, title=p_title, subtitle=p_sub, border_style="green", box=box.ROUNDED)
 
