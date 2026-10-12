@@ -25,6 +25,7 @@ import sqlite3
 import re
 import argparse
 import subprocess
+import shutil
 from typing import Optional, List, Dict, Any
 
 from rich.console import Console
@@ -40,6 +41,8 @@ from session_engine import (
     list_workspaces,
     format_workspace_path,
     get_workspace_label,
+    parse_time,
+    format_relative,
     copy_to_clipboard,
     DEFAULT_SUMMARIES_DB,
     DEFAULT_BRAIN_DIR,
@@ -51,6 +54,7 @@ from tui import (
     ToolCutterTUI,
     show_success_screen,
     show_transcript_pager,
+    build_conversation_preview_lines,
     run_conversation_picker
 )
 
@@ -240,6 +244,137 @@ def print_tools_table(reader: SessionReader, turn_num: Optional[int] = None):
 
 
 # ==============================================================================
+# FZF Integration (When fzf is installed or --fzf is passed)
+# ==============================================================================
+
+def run_fzf_tui(initial_query: str = "", show_all: bool = False):
+    """Launches fzf with live side-by-side preview window if fzf is installed."""
+    script_path = os.path.abspath(__file__)
+    current_show_all = show_all
+
+    while True:
+        if not os.path.exists(DEFAULT_SUMMARIES_DB):
+            console.print("[bold red]Database not found.[/bold red]")
+            return
+
+        conn = sqlite3.connect(DEFAULT_SUMMARIES_DB)
+        cur = conn.cursor()
+        if current_show_all:
+            cur.execute("""
+                SELECT conversation_id, title, preview, step_count, last_modified_time,
+                       workspace_uris, agent_name, nesting_depth, parent_conversation_id
+                FROM conversation_summaries ORDER BY last_modified_time DESC
+            """)
+        else:
+            cur.execute("""
+                SELECT conversation_id, title, preview, step_count, last_modified_time,
+                       workspace_uris, agent_name, nesting_depth, parent_conversation_id
+                FROM conversation_summaries WHERE nesting_depth = 0 AND step_count > 0
+                ORDER BY last_modified_time DESC
+            """)
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows and not current_show_all:
+            current_show_all = True
+            continue
+
+        lines = []
+        for row in rows:
+            cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row
+            dt = parse_time(last_mod)
+            rel_time = format_relative(dt)
+            workspace = format_workspace_path(ws_uris)
+            effective_title = (title or "").strip()
+            if not effective_title:
+                if agent_name:
+                    effective_title = f"[{agent_name}]"
+                elif prev:
+                    effective_title = prev.strip().splitlines()[0][:50]
+                else:
+                    effective_title = "(Untitled Session)"
+
+            short_id = cid[:8]
+            if agent_name:
+                tag = "\033[35m[agent]\033[0m"
+            else:
+                tag = "\033[32m●\033[0m"
+
+            display_col = (
+                f"{tag} \033[36m{short_id}\033[0m  "
+                f"\033[1;37m{effective_title:<38}\033[0m  "
+                f"\033[33m{rel_time:<10}\033[0m  "
+                f"\033[34m{step_count:>3} steps\033[0m  "
+                f"\033[2m{workspace}\033[0m"
+            )
+            lines.append(f"{cid}\t{display_col}")
+
+        input_data = "\n".join(lines)
+        mode_str = "All Sessions (incl. subagents)" if current_show_all else "Main Chats Only"
+        header = (
+            f"Mode: {mode_str}\n"
+            "ENTER: Continue Chat | CTRL-T: Full Transcript | CTRL-Y: Copy ID | CTRL-A: Toggle All | ESC: Quit"
+        )
+
+        fzf_cmd = [
+            "fzf",
+            "--ansi",
+            "--delimiter=\t",
+            "--with-nth=2..",
+            f"--preview=python \"{script_path}\" --preview {{1}}",
+            "--preview-window=right:52%:wrap",
+            f"--header={header}",
+            "--prompt=Resume Chat > ",
+            "--expect=ctrl-t,ctrl-y,ctrl-a,enter",
+            "--height=90%",
+            "--border=rounded",
+            "--info=inline",
+        ]
+        if initial_query:
+            fzf_cmd.append(f"--query={initial_query}")
+            initial_query = ""
+
+        try:
+            proc = subprocess.Popen(
+                fzf_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                shell=(sys.platform == "win32")
+            )
+            stdout, _ = proc.communicate(input=input_data)
+        except Exception:
+            app = MainChatsTUI(show_all=current_show_all, initial_query=initial_query)
+            app.run()
+            return
+
+        if proc.returncode != 0 and not stdout:
+            return
+
+        out_lines = stdout.strip().splitlines()
+        if not out_lines:
+            return
+
+        key_pressed = out_lines[0].strip() if len(out_lines) >= 2 else "enter"
+        chosen_line = out_lines[1] if len(out_lines) >= 2 else out_lines[0]
+        cid = chosen_line.split("\t")[0].strip()
+
+        if key_pressed == "ctrl-a":
+            current_show_all = not current_show_all
+            continue
+        elif key_pressed == "ctrl-y":
+            copy_to_clipboard(cid)
+            console.print(f"[bold green]Copied UUID {cid} to clipboard![/bold green]")
+            return
+        elif key_pressed == "ctrl-t":
+            show_transcript_pager(cid)
+            continue
+        else:
+            resume_conversation(cid)
+            return
+
+
+# ==============================================================================
 # CLI Entry Point
 # ==============================================================================
 
@@ -354,8 +489,41 @@ def main():
         action="store_true",
         help="Do not copy artifacts and system logs from the brain directory when forking."
     )
+    parser.add_argument(
+        "--preview",
+        metavar="CID",
+        default=None,
+        help="Print live preview for a conversation and exit."
+    )
+    parser.add_argument(
+        "--fzf",
+        action="store_true",
+        help="Force fzf TUI if fzf is installed."
+    )
 
     args = parser.parse_args()
+
+    # 0. Handle Live Preview Flag / Subcommand
+    target_preview = args.preview or (args.arg2 if args.conversation == "preview" else None)
+    if target_preview:
+        cid = resolve_conversation(target_preview)
+        if cid:
+            conn = sqlite3.connect(DEFAULT_SUMMARIES_DB)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT conversation_id, title, preview, step_count, last_modified_time,
+                       workspace_uris, agent_name, nesting_depth, parent_conversation_id
+                FROM conversation_summaries WHERE conversation_id = ?
+            """, (cid,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                lines = build_conversation_preview_lines(cid, row)
+                for l in lines:
+                    console.print(l)
+            else:
+                console.print(f"[bold red]Conversation {cid} not found.[/bold red]")
+        return
 
     # 1. Handle Workspace Move CLI
     if args.move:
@@ -610,6 +778,10 @@ def main():
                 return
 
     # 10. Default Launch: Master Interactive Chats TUI
+    if args.fzf and shutil.which("fzf"):
+        run_fzf_tui(initial_query=args.conversation or "", show_all=args.all)
+        return
+
     initial_q = args.conversation or ""
     app = MainChatsTUI(show_all=args.all, initial_query=initial_q, default_action="resume")
     app.run()

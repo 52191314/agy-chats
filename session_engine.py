@@ -474,6 +474,39 @@ def normalize_workspace_uri(path_str: str) -> str:
     return f"file://{clean}"
 
 
+def parse_time(s: Optional[str]) -> Optional[datetime]:
+    if not s or s.startswith("0001"):
+        return None
+    s = s.strip()
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def format_relative(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "Never"
+    now = datetime.now(timezone.utc)
+    diff = now - dt
+    secs = int(diff.total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return f"{secs}s ago"
+    elif secs < 3600:
+        return f"{secs // 60}m ago"
+    elif secs < 86400:
+        return f"{secs // 3600}h ago"
+    elif secs < 86400 * 30:
+        return f"{secs // 86400}d ago"
+    else:
+        return dt.strftime("%b %d")
+
+
 def get_workspace_label(ws_uris: Optional[str]) -> str:
     if not ws_uris:
         return "(no workspace)"

@@ -38,6 +38,8 @@ from session_engine import (
     list_workspaces,
     format_workspace_path,
     get_workspace_label,
+    parse_time,
+    format_relative,
     copy_to_clipboard,
     DEFAULT_CONV_DIR,
     DEFAULT_BRAIN_DIR,
@@ -698,6 +700,156 @@ class TurnExplorerTUI:
 
 
 # ==============================================================================
+# Live Conversation Preview Builder (Split Screen Right Pane)
+# ==============================================================================
+
+def build_conversation_preview_lines(cid: str, row_data: Tuple, max_width: int = 65) -> List[Text]:
+    """Builds formatted lines for the right-hand scrollable preview pane."""
+    lines: List[Text] = []
+    cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row_data
+
+    dt = parse_time(last_mod)
+    rel_time = format_relative(dt)
+    exact_time = dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else (last_mod or "")[:19]
+    ws_str = format_workspace_path(ws_uris)
+
+    try:
+        reader = SessionReader(cid)
+        turns = reader.get_turns()
+    except Exception:
+        turns = []
+
+    eff_title = (title or "").strip()
+    if not eff_title:
+        if turns and turns[0].get("user_text"):
+            eff_title = turns[0]["user_text"].splitlines()[0][:50]
+        elif agent_name:
+            eff_title = f"Subagent: {agent_name}"
+        elif prev:
+            eff_title = prev.strip().splitlines()[0][:50]
+        else:
+            eff_title = "(Untitled Session)"
+
+    # 1. Stylized Boxed Title (matching original preview pane)
+    box_inner_w = max(10, min(max_width - 4, len(eff_title) + 4))
+    title_display = f" {eff_title} "
+    if len(title_display) > box_inner_w:
+        title_display = title_display[:box_inner_w - 3] + "... "
+
+    t_top = Text("╭" + "─" * box_inner_w + "╮", style="bold cyan")
+    t_mid = Text("│", style="bold cyan")
+    t_mid.append(f"{title_display:<{box_inner_w}}", style="bold white")
+    t_mid.append("│", style="bold cyan")
+    t_bot = Text("╰" + "─" * box_inner_w + "╯", style="bold cyan")
+
+    lines.append(t_top)
+    lines.append(t_mid)
+    lines.append(t_bot)
+    lines.append(Text(""))
+
+    # 2. Metadata Block
+    t_id = Text("ID:        ", style="bold")
+    t_id.append(cid, style="dim cyan")
+    lines.append(t_id)
+
+    t_type = Text()
+    if agent_name:
+        t_type.append("Agent:     ", style="bold")
+        t_type.append(f"{agent_name} (depth {depth})", style="bold magenta")
+    else:
+        t_type.append("Type:      ", style="bold")
+        t_type.append("Main User Session", style="bold green")
+    lines.append(t_type)
+
+    t_act = Text("Active:    ", style="bold")
+    t_act.append(rel_time, style="bold yellow")
+    t_act.append(f" ({exact_time})", style="dim")
+    lines.append(t_act)
+
+    t_stats = Text("Stats:     ", style="bold")
+    t_stats.append(f"{step_count} total steps", style="cyan")
+    t_stats.append(f" • {len(turns)} user turns", style="blue")
+    lines.append(t_stats)
+
+    t_ws = Text("Workspace: ", style="bold")
+    t_ws.append(ws_str, style="green")
+    lines.append(t_ws)
+    lines.append(Text(""))
+
+    # 3. Turns & Content
+    if turns:
+        # Initial user request
+        lines.append(Text("▶ INITIAL USER REQUEST:", style="bold yellow"))
+        init_lines = turns[0]["user_text"].strip().splitlines()
+        for l in init_lines:
+            t = Text("  │ ", style="dim")
+            t.append(l, style="white")
+            lines.append(t)
+        lines.append(Text(""))
+
+        # Assistant response for Turn 1
+        if turns[0].get("assistant_text"):
+            lines.append(Text("▶ ASSISTANT RESPONSE:", style="bold green"))
+            for l in turns[0]["assistant_text"].strip().splitlines():
+                t = Text("  │ ", style="dim")
+                t.append(l, style="dim white")
+                lines.append(t)
+            lines.append(Text(""))
+
+        if turns[0].get("tools"):
+            t_tools = Text("  ▶ Tools Executed (", style="bold cyan")
+            t_tools.append(f"{len(turns[0]['tools'])} tools): ", style="bold cyan")
+            tool_badges = [tl.get("short_label", tl["tool_name"]) for tl in turns[0]["tools"][:3]]
+            t_tools.append(", ".join(tool_badges), style="yellow")
+            if len(turns[0]["tools"]) > 3:
+                t_tools.append(f" +{len(turns[0]['tools']) - 3} more", style="dim")
+            lines.append(t_tools)
+            lines.append(Text(""))
+
+        # Subsequent turns
+        for turn in turns[1:]:
+            lines.append(Text(f"▶ USER TURN #{turn['turn_index']}:", style="bold yellow"))
+            for l in turn["user_text"].strip().splitlines():
+                t = Text("  │ ", style="dim")
+                t.append(l, style="white")
+                lines.append(t)
+            lines.append(Text(""))
+
+            if turn.get("assistant_text"):
+                lines.append(Text(f"▶ ASSISTANT (Turn #{turn['turn_index']}):", style="bold green"))
+                for l in turn["assistant_text"].strip().splitlines():
+                    t = Text("  │ ", style="dim")
+                    t.append(l, style="dim white")
+                    lines.append(t)
+                lines.append(Text(""))
+
+            if turn.get("tools"):
+                t_tools = Text("  ▶ Tools (", style="bold cyan")
+                t_tools.append(f"{len(turn['tools'])} tools): ", style="bold cyan")
+                tool_badges = [tl.get("short_label", tl["tool_name"]) for tl in turn["tools"][:3]]
+                t_tools.append(", ".join(tool_badges), style="yellow")
+                if len(turn["tools"]) > 3:
+                    t_tools.append(f" +{len(turn['tools']) - 3} more", style="dim")
+                lines.append(t_tools)
+                lines.append(Text(""))
+    elif prev:
+        lines.append(Text("▶ PREVIEW SNIPPET:", style="bold yellow"))
+        for l in prev.strip().splitlines():
+            t = Text("  │ ", style="dim")
+            t.append(l, style="white")
+            lines.append(t)
+        lines.append(Text(""))
+
+    # 4. Resume CLI Command
+    lines.append(Text("─" * min(max_width, 60), style="dim"))
+    t_cli = Text("Resume CLI: ", style="bold")
+    t_cli.append(f"agy --conversation {cid}", style="bold cyan")
+    lines.append(t_cli)
+
+    return lines
+
+
+# ==============================================================================
 # MainChatsTUI: Master Conversation Explorer, Forker & Workspace Manager
 # ==============================================================================
 
@@ -717,6 +869,9 @@ class MainChatsTUI:
         self.visible_indices = []
         self.selected_idx = 0
         self.page_size = 14
+        self.preview_scroll_offset = 0
+        self.preview_cache = {}
+        self.scroll_mode = False
         self.refresh_data()
 
     def refresh_data(self):
@@ -767,6 +922,8 @@ class MainChatsTUI:
     def render(self):
         os.system("cls" if os.name == "nt" else "clear")
 
+        term_cols, term_lines = shutil.get_terminal_size((120, 30))
+
         header_text = Text()
         if self.default_action == "fork":
             header_text.append("Antigravity Session Forker (agy-fork)  |  ", style="bold cyan")
@@ -797,17 +954,20 @@ class MainChatsTUI:
             self.selected_idx = self.visible_indices[0]
 
         curr_pos = self.visible_indices.index(self.selected_idx)
+        self.page_size = max(6, min(14, term_lines - 12))
         start_pos = max(0, curr_pos - self.page_size // 2)
         end_pos = min(len(self.visible_indices), start_pos + self.page_size)
         if end_pos - start_pos < self.page_size:
             start_pos = max(0, end_pos - self.page_size)
 
-        table = Table(box=box.SIMPLE_HEAVY, expand=True)
-        table.add_column("ID", style="cyan", width=10)
-        table.add_column("Active", justify="center", width=12)
-        table.add_column("Steps", justify="right", width=7)
-        table.add_column("Workspace", style="green", width=14)
-        table.add_column("Title / Snippet", style="white", ratio=1)
+        # 1. Left Table: Conversations List
+        list_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        list_table.add_column("", justify="center", width=2)
+        list_table.add_column("ID", style="cyan", width=8)
+        list_table.add_column("Title", style="white", ratio=1)
+        list_table.add_column("Active", justify="center", width=8)
+        list_table.add_column("Steps", justify="right", width=6)
+        list_table.add_column("Dir", style="green", width=9)
 
         for pos in range(start_pos, end_pos):
             idx = self.visible_indices[pos]
@@ -815,55 +975,106 @@ class MainChatsTUI:
             cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row
             is_selected = (idx == self.selected_idx)
 
-            rel_time = "Recent"
+            dt = parse_time(last_mod)
+            rel_time = format_relative(dt)
             ws_label = get_workspace_label(ws_uris)
             eff_title = (title or "").strip()
             if not eff_title:
                 if agent_name: eff_title = f"[{agent_name}]"
-                elif prev: eff_title = prev.strip().splitlines()[0][:50]
+                elif prev: eff_title = prev.strip().splitlines()[0][:35]
                 else: eff_title = "(Untitled Session)"
 
-            id_str = f"> {cid[:8]}" if is_selected else cid[:8]
+            dot = "[magenta]▲[/magenta]" if agent_name else "[green]●[/green]"
+            id_str = f">{cid[:7]}" if is_selected else cid[:8]
             row_style = "bold white on blue" if is_selected else "none"
 
-            table.add_row(id_str, rel_time, str(step_count), escape(ws_label[:14]), escape(eff_title), style=row_style)
+            list_table.add_row(
+                dot,
+                id_str,
+                escape(eff_title[:32]),
+                rel_time[:8],
+                str(step_count),
+                escape(ws_label[:9]),
+                style=row_style
+            )
 
-        console.print(table)
+        left_panel = Panel(list_table, title=f"Conversations ({len(self.visible_indices)})", border_style="cyan", box=box.ROUNDED)
 
+        # 2. Right Pane: Scrollable Live Preview
         sel_row = self.rows[self.selected_idx]
-        cid = sel_row[0]
-        title = sel_row[1] or "(Untitled Session)"
-        step_count = sel_row[3]
-        ws_str = format_workspace_path(sel_row[5])
+        sel_cid = sel_row[0]
+        preview_w = max(40, (term_cols // 2) - 4)
 
-        preview_text = Text()
-        preview_text.append(f"{title}\n", style="bold yellow")
-        preview_text.append(f"UUID: {cid}  |  Steps: {step_count}  |  Workspace: {ws_str}\n", style="dim")
+        if sel_cid not in self.preview_cache:
+            self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
+        all_preview_lines = self.preview_cache[sel_cid]
 
-        console.print(Panel(preview_text, title="[bold]Session Details[/bold]", border_style="yellow", box=box.ROUNDED))
+        avail_h = max(6, term_lines - 12)
+        max_offset = max(0, len(all_preview_lines) - avail_h)
+        self.preview_scroll_offset = max(0, min(self.preview_scroll_offset, max_offset))
+
+        visible_preview = all_preview_lines[self.preview_scroll_offset : self.preview_scroll_offset + avail_h]
+
+        preview_content = Text()
+        for idx, line in enumerate(visible_preview):
+            if idx > 0:
+                preview_content.append("\n")
+            preview_content.append_text(line)
+
+        # Scroll Indicators in Preview Panel
+        if self.preview_scroll_offset > 0:
+            p_title = f"Preview [bold yellow](▲ {self.preview_scroll_offset} lines above - K/[ to scroll)[/bold yellow]"
+        else:
+            p_title = "Session Preview"
+
+        remaining_lines = max(0, len(all_preview_lines) - (self.preview_scroll_offset + avail_h))
+        if remaining_lines > 0:
+            p_sub = f"[bold yellow]▼ {remaining_lines} lines below (use J/K or [/] to scroll)[/bold yellow]"
+        else:
+            p_sub = "[dim](End of Preview)[/dim]"
+
+        right_panel = Panel(preview_content, title=p_title, subtitle=p_sub, border_style="green", box=box.ROUNDED)
+
+        # Side-by-Side Split Screen Layout
+        if term_cols >= 85:
+            grid = Table.grid(expand=True)
+            grid.add_column("left", ratio=5, min_width=42)
+            grid.add_column("right", ratio=5, min_width=42)
+            grid.add_row(left_panel, right_panel)
+            console.print(grid)
+        else:
+            console.print(left_panel)
+            console.print(right_panel)
+
         self.render_controls()
 
     def render_controls(self):
         ctrls = Text()
-        ctrls.append(" [Up/Down] Select  |  ", style="bold cyan")
-        if self.default_action == "fork":
-            ctrls.append("[Enter] Fork Turns  |  ", style="bold green")
-            ctrls.append("[T] Tool Cutter  |  ", style="bold yellow")
-            ctrls.append("[r] Resume  |  ", style="cyan")
-        elif self.default_action == "tool":
-            ctrls.append("[Enter] Tool Cutter  |  ", style="bold green")
-            ctrls.append("[f] Fork Turns  |  ", style="bold yellow")
-            ctrls.append("[r] Resume  |  ", style="cyan")
+        if self.scroll_mode:
+            ctrls.append(" [SCROLL MODE] ", style="bold black on yellow")
+            ctrls.append(" [Up/Down or k/j] Scroll Preview  |  [p] Switch to List  |  [q/Esc] Exit", style="bold cyan")
         else:
-            ctrls.append("[Enter] Resume  |  ", style="bold green")
-            ctrls.append("[f] Fork / Branch  |  ", style="bold yellow")
+            ctrls.append(" [Up/Down] Select  |  ", style="bold cyan")
+            ctrls.append("[J/K or [/]] Scroll Preview  |  ", style="bold yellow")
+            if self.default_action == "fork":
+                ctrls.append("[Enter] Fork Turns  |  ", style="bold green")
+                ctrls.append("[T] Tool Cutter  |  ", style="bold yellow")
+                ctrls.append("[r] Resume  |  ", style="cyan")
+            elif self.default_action == "tool":
+                ctrls.append("[Enter] Tool Cutter  |  ", style="bold green")
+                ctrls.append("[f] Fork Turns  |  ", style="bold yellow")
+                ctrls.append("[r] Resume  |  ", style="cyan")
+            else:
+                ctrls.append("[Enter] Resume  |  ", style="bold green")
+                ctrls.append("[f] Fork  |  ", style="bold yellow")
 
-        ctrls.append("[m] Move Workspace  |  ", style="bold magenta")
-        ctrls.append("[t] Transcript  |  ", style="bold white")
-        ctrls.append("[y] Copy ID  |  ", style="dim")
-        ctrls.append("[a] Toggle All  |  ", style="dim")
-        ctrls.append("[/] Search  |  ", style="dim")
-        ctrls.append("[q/Esc] Quit", style="bold red")
+            ctrls.append("[m] Move  |  ", style="bold magenta")
+            ctrls.append("[t] Transcript  |  ", style="bold white")
+            ctrls.append("[p] Scroll  |  ", style="dim")
+            ctrls.append("[y] Copy  |  ", style="dim")
+            ctrls.append("[a] Toggle  |  ", style="dim")
+            ctrls.append("[/] Search  |  ", style="dim")
+            ctrls.append("[q/Esc] Quit", style="bold red")
         console.print(ctrls)
 
     def interactive_move(self):
@@ -918,36 +1129,74 @@ class MainChatsTUI:
             self.render()
             k = get_key()
 
+            # Preview scroll keys
+            if k in ("]", "J"):
+                self.preview_scroll_offset += 3
+                continue
+            elif k in ("[", "K"):
+                self.preview_scroll_offset = max(0, self.preview_scroll_offset - 3)
+                continue
+            elif k in ("p", "P"):
+                self.scroll_mode = not self.scroll_mode
+                continue
+
+            # Navigation in scroll mode vs list mode
+            if self.scroll_mode:
+                if k in ("UP", "k"):
+                    self.preview_scroll_offset = max(0, self.preview_scroll_offset - 2)
+                    continue
+                elif k in ("DOWN", "j"):
+                    self.preview_scroll_offset += 2
+                    continue
+                elif k == "PAGE_UP":
+                    self.preview_scroll_offset = max(0, self.preview_scroll_offset - 8)
+                    continue
+                elif k == "PAGE_DOWN":
+                    self.preview_scroll_offset += 8
+                    continue
+                elif k in ("ESC", "q"):
+                    self.scroll_mode = False
+                    continue
+
+            # Standard list navigation
             if k in ("UP", "k"):
                 if self.visible_indices:
                     curr_pos = self.visible_indices.index(self.selected_idx)
                     if curr_pos > 0:
                         self.selected_idx = self.visible_indices[curr_pos - 1]
+                        self.preview_scroll_offset = 0
             elif k in ("DOWN", "j"):
                 if self.visible_indices:
                     curr_pos = self.visible_indices.index(self.selected_idx)
                     if curr_pos < len(self.visible_indices) - 1:
                         self.selected_idx = self.visible_indices[curr_pos + 1]
+                        self.preview_scroll_offset = 0
             elif k == "PAGE_UP":
                 if self.visible_indices:
                     curr_pos = self.visible_indices.index(self.selected_idx)
                     self.selected_idx = self.visible_indices[max(0, curr_pos - self.page_size)]
+                    self.preview_scroll_offset = 0
             elif k == "PAGE_DOWN":
                 if self.visible_indices:
                     curr_pos = self.visible_indices.index(self.selected_idx)
                     self.selected_idx = self.visible_indices[min(len(self.visible_indices) - 1, curr_pos + self.page_size)]
+                    self.preview_scroll_offset = 0
             elif k == "HOME":
                 if self.visible_indices:
                     self.selected_idx = self.visible_indices[0]
+                    self.preview_scroll_offset = 0
             elif k == "END":
                 if self.visible_indices:
                     self.selected_idx = self.visible_indices[-1]
+                    self.preview_scroll_offset = 0
             elif k in ("/",):
                 q = prompt_input("Search (title, UUID, workspace):")
                 self.update_filter(q)
+                self.preview_scroll_offset = 0
             elif k in ("a", "A"):
                 self.show_all = not self.show_all
                 self.refresh_data()
+                self.preview_scroll_offset = 0
             elif k in ("m", "M"):
                 self.interactive_move()
             elif k in ("f", "F"):
@@ -1010,6 +1259,7 @@ class MainChatsTUI:
             elif k == "ESC":
                 if self.filter_query:
                     self.update_filter("")
+                    self.preview_scroll_offset = 0
                 else:
                     return
             elif k in ("q", "Q"):
