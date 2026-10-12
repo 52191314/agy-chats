@@ -62,6 +62,8 @@ def get_key() -> str:
             ch2 = msvcrt.getch()
             if ch2 == b'H': return "UP"
             elif ch2 == b'P': return "DOWN"
+            elif ch2 == b'K': return "LEFT"
+            elif ch2 == b'M': return "RIGHT"
             elif ch2 == b'I': return "PAGE_UP"
             elif ch2 == b'Q': return "PAGE_DOWN"
             elif ch2 == b'G': return "HOME"
@@ -92,6 +94,8 @@ def get_key() -> str:
                     ch3 = sys.stdin.read(1)
                     if ch3 == 'A': return "UP"
                     elif ch3 == 'B': return "DOWN"
+                    elif ch3 == 'C': return "RIGHT"
+                    elif ch3 == 'D': return "LEFT"
                     elif ch3 == '5': sys.stdin.read(1); return "PAGE_UP"
                     elif ch3 == '6': sys.stdin.read(1); return "PAGE_DOWN"
                     elif ch3 == 'H': return "HOME"
@@ -928,10 +932,11 @@ def build_directory_preview_lines(dir_name: str, dir_path: str, rows_in_dir: Lis
         eff_title = (title or "").strip()
         if not eff_title:
             eff_title = (prev or "").strip().splitlines()[0][:28] if prev else "(Untitled)"
-        t_row = Text(f"  {idx+1:2d}. ", style="dim")
-        t_row.append(f"{cid[:8]} ", style="cyan")
-        t_row.append(f"{eff_title[:26]:<26} ", style="white")
-        t_row.append(f"({rel})", style="dim")
+        avail_title = max(10, max_width - 23)
+        t_row = Text(f" {idx+1:2d}. ", style="dim")
+        t_row.append(f"{cid[:6]} ", style="cyan")
+        t_row.append(f"{eff_title[:avail_title]:<{avail_title}} ", style="white")
+        t_row.append(f"{rel[:7]}", style="dim")
         lines.append(t_row)
 
     if len(rows_in_dir) > 15:
@@ -969,11 +974,11 @@ class MainChatsTUI:
         self.rows = []
         self.visible_indices = []
         self.selected_idx = 0
-        self.page_size = 14
+        self.page_size = 10
         self.preview_scroll_offset = 0
         self.preview_cache = {}
         self.dir_preview_cache = {}
-        self.active_focus: str = "preview"  # Default to preview scrolling!
+        self.active_focus: str = "list"  # Default: Up/Down arrow keys move session selection!
         self.refresh_data()
 
     def refresh_data(self):
@@ -1155,28 +1160,28 @@ class MainChatsTUI:
             self.render_controls()
             return
 
-        # Height budgeted strictly to avoid terminal window vertical overflow
-        avail_h = max(6, term_lines - 10)
-        self.page_size = avail_h
+        # Height budgeted strictly to avoid terminal window vertical overflow:
+        # 10 item rows + table header = 14 lines content height
+        avail_h = self.page_size + 4
 
         # -------------------------------------------------------------
         # 1. Left Table: Workspaces Tree vs Flat Conversations List
         # -------------------------------------------------------------
-        list_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        list_table = Table(box=box.SIMPLE_HEAVY, expand=True, pad_edge=False, padding=(0, 1))
 
         if self.group_by_dir:
-            list_table.add_column("", justify="center", width=2)
-            list_table.add_column("Folder / ID", style="cyan", width=12)
-            list_table.add_column("Workspace / Session Title", style="white", ratio=1)
-            list_table.add_column("Active", justify="center", width=8)
-            list_table.add_column("Steps", justify="right", width=6)
-
             total_tree = len(self.tree_items)
+            total_pages = max(1, (total_tree + self.page_size - 1) // self.page_size) if total_tree else 1
             self.tree_cursor = max(0, min(self.tree_cursor, total_tree - 1)) if total_tree else 0
-            start_pos = max(0, self.tree_cursor - self.page_size // 2)
+            curr_page = (self.tree_cursor // self.page_size) + 1 if total_tree else 1
+            start_pos = (curr_page - 1) * self.page_size
             end_pos = min(total_tree, start_pos + self.page_size)
-            if end_pos - start_pos < self.page_size:
-                start_pos = max(0, end_pos - self.page_size)
+
+            list_table.add_column("", justify="center", width=2, no_wrap=True)
+            list_table.add_column("Folder / ID", style="cyan", width=12, no_wrap=True)
+            list_table.add_column("Workspace / Session Title", style="white", ratio=1, no_wrap=True, overflow="ellipsis")
+            list_table.add_column("Active", justify="center", width=8, no_wrap=True)
+            list_table.add_column("Steps", justify="right", width=5, no_wrap=True)
 
             for pos in range(start_pos, end_pos):
                 item = self.tree_items[pos]
@@ -1207,29 +1212,40 @@ class MainChatsTUI:
                     list_table.add_row(
                         dot,
                         id_str,
-                        escape(f"  {title[:30]}"),
+                        escape(f"  {title}"),
                         rel_time[:8],
                         str(r[3]),
                         style=row_style
                     )
 
-            left_title = f"Workspaces ({len(self.tree_items)} items)"
+            # Pad empty rows to maintain fixed height
+            for _ in range(self.page_size - (end_pos - start_pos)):
+                list_table.add_row("", "", "", "", "")
+
+            left_title = f"Workspaces [Page {curr_page}/{total_pages} • {total_tree} items]"
         else:
-            if self.selected_idx not in self.visible_indices:
-                self.selected_idx = self.visible_indices[0] if self.visible_indices else 0
+            if not self.visible_indices:
+                total_items = 0
+                total_pages = 1
+                curr_page = 1
+                start_pos = 0
+                end_pos = 0
+            else:
+                total_items = len(self.visible_indices)
+                total_pages = max(1, (total_items + self.page_size - 1) // self.page_size)
+                if self.selected_idx not in self.visible_indices:
+                    self.selected_idx = self.visible_indices[0]
+                curr_pos = self.visible_indices.index(self.selected_idx)
+                curr_page = (curr_pos // self.page_size) + 1
+                start_pos = (curr_page - 1) * self.page_size
+                end_pos = min(total_items, start_pos + self.page_size)
 
-            curr_pos = self.visible_indices.index(self.selected_idx) if self.visible_indices else 0
-            start_pos = max(0, curr_pos - self.page_size // 2)
-            end_pos = min(len(self.visible_indices), start_pos + self.page_size)
-            if end_pos - start_pos < self.page_size:
-                start_pos = max(0, end_pos - self.page_size)
-
-            list_table.add_column("", justify="center", width=2)
-            list_table.add_column("ID", style="cyan", width=8)
-            list_table.add_column("Title", style="white", ratio=1)
-            list_table.add_column("Active", justify="center", width=8)
-            list_table.add_column("Steps", justify="right", width=6)
-            list_table.add_column("Dir", style="green", width=9)
+            list_table.add_column("", justify="center", width=2, no_wrap=True)
+            list_table.add_column("ID", style="cyan", width=8, no_wrap=True)
+            list_table.add_column("Title", style="white", ratio=1, no_wrap=True, overflow="ellipsis")
+            list_table.add_column("Active", justify="center", width=8, no_wrap=True)
+            list_table.add_column("Steps", justify="right", width=5, no_wrap=True)
+            list_table.add_column("Dir", style="green", width=8, no_wrap=True, overflow="ellipsis")
 
             for pos in range(start_pos, end_pos):
                 idx = self.visible_indices[pos]
@@ -1247,36 +1263,40 @@ class MainChatsTUI:
                     else: eff_title = "(Untitled Session)"
 
                 dot = "[magenta]▲[/magenta]" if agent_name else "[green]●[/green]"
-                id_str = f">{cid[:7]}" if is_selected else cid[:8]
+                id_str = f">{cid[:7]}" if is_selected else f" {cid[:7]}"
                 row_style = "bold white on blue" if is_selected else "none"
 
                 list_table.add_row(
                     dot,
                     id_str,
-                    escape(eff_title[:32]),
+                    escape(eff_title),
                     rel_time[:8],
                     str(step_count),
-                    escape(ws_label[:9]),
+                    escape(ws_label[:8]),
                     style=row_style
                 )
 
-            left_title = f"Conversations ({len(self.visible_indices)})"
+            # Pad empty rows to maintain fixed height
+            for _ in range(self.page_size - (end_pos - start_pos)):
+                list_table.add_row("", "", "", "", "", "")
+
+            left_title = f"Conversations [Page {curr_page}/{total_pages} • {total_items} total]"
 
         if self.active_focus == "list":
             left_border = "yellow"
             p_left_title = Text(f"[LIST ACTIVE] {left_title}", style="bold yellow")
-            p_left_sub = Text("Use ▲/▼ to select  |  Tab to focus preview", style="dim cyan")
+            p_left_sub = Text("▲/▼ Select  |  ◀/▶ Page  |  j/k Scroll  |  Tab Focus", style="dim cyan")
         else:
             left_border = "cyan"
             p_left_title = Text(left_title, style="bold cyan")
-            p_left_sub = Text("Left/Right switch session  |  Tab for list focus", style="dim")
+            p_left_sub = Text("◀/▶ Switch Session  |  Tab Focus List", style="dim")
 
         left_panel = Panel(list_table, title=p_left_title, subtitle=p_left_sub, border_style=left_border, box=box.ROUNDED)
 
         # -------------------------------------------------------------
         # 2. Right Pane: Scrollable Live Preview (Pre-wrapped to fit viewport)
         # -------------------------------------------------------------
-        preview_w = max(40, (term_cols // 2) - 4)
+        preview_w = max(38, (term_cols * 5 // 12) - 4)
 
         if self.group_by_dir and self.tree_items:
             sel_item = self.tree_items[self.tree_cursor]
@@ -1294,11 +1314,14 @@ class MainChatsTUI:
                     self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
                 all_preview_lines = self.preview_cache[sel_cid]
         else:
-            sel_row = self.rows[self.selected_idx]
-            sel_cid = sel_row[0]
-            if sel_cid not in self.preview_cache:
-                self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
-            all_preview_lines = self.preview_cache[sel_cid]
+            if self.visible_indices:
+                sel_row = self.rows[self.selected_idx]
+                sel_cid = sel_row[0]
+                if sel_cid not in self.preview_cache:
+                    self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
+                all_preview_lines = self.preview_cache[sel_cid]
+            else:
+                all_preview_lines = [Text("No conversation selected.", style="dim")]
 
         max_offset = max(0, len(all_preview_lines) - avail_h)
         self.preview_scroll_offset = max(0, min(self.preview_scroll_offset, max_offset))
@@ -1325,14 +1348,14 @@ class MainChatsTUI:
             p_title.append("Preview ", style="bold")
 
         if self.preview_scroll_offset > 0:
-            p_title.append(f"(▲ {self.preview_scroll_offset} lines above - ▲/k to scroll)", style="bold yellow")
+            p_title.append(f"(▲ {self.preview_scroll_offset} lines above - j/k to scroll)", style="bold yellow")
         else:
             p_title.append("Details", style="dim")
 
         p_sub = Text()
         remaining_lines = max(0, len(all_preview_lines) - (self.preview_scroll_offset + avail_h))
         if remaining_lines > 0:
-            p_sub.append(f"▼ {remaining_lines} lines below (use ▲/▼ or j/k to scroll)", style="bold yellow")
+            p_sub.append(f"▼ {remaining_lines} lines below (use j/k to scroll)", style="bold yellow")
         else:
             p_sub.append("(End of Preview)", style="dim")
 
@@ -1342,8 +1365,8 @@ class MainChatsTUI:
         # Side-by-Side Split Screen Layout
         if term_cols >= 85:
             grid = Table.grid(expand=True)
-            grid.add_column("left", ratio=5, min_width=42)
-            grid.add_column("right", ratio=5, min_width=42)
+            grid.add_column("left", ratio=7, min_width=50)
+            grid.add_column("right", ratio=5, min_width=38)
             grid.add_row(left_panel, right_panel)
             console.print(grid)
         else:
@@ -1357,20 +1380,21 @@ class MainChatsTUI:
         if self.active_focus == "preview":
             ctrls.append(" [PREVIEW] ", style="bold black on green")
             ctrls.append(" [▲/▼ or j/k] Scroll  |  ", style="bold green")
-            ctrls.append("[◀/▶ or [/]] Switch Session  |  ", style="bold cyan")
+            ctrls.append("[◀/▶] Switch Session  |  ", style="bold cyan")
             ctrls.append("[Tab] Focus List  |  ", style="yellow")
         else:
             ctrls.append(" [LIST] ", style="bold black on yellow")
             ctrls.append(" [▲/▼] Select  |  ", style="bold yellow")
+            ctrls.append("[◀/▶] Page  |  ", style="bold cyan")
             if self.group_by_dir:
                 ctrls.append("[Space/Enter] Expand/Collapse  |  ", style="bold cyan")
+            ctrls.append("[j/k] Scroll  |  ", style="dim green")
             ctrls.append("[Tab] Focus Preview  |  ", style="green")
 
-        ctrls.append("[g] Group Dirs  |  ", style="bold magenta")
+        ctrls.append("[g] Group  |  ", style="bold magenta")
         ctrls.append("[#] Limit  |  ", style="bold yellow")
         ctrls.append("[Enter] Resume  |  ", style="bold green")
         ctrls.append("[f] Fork  |  ", style="cyan")
-        ctrls.append("[m] Move  |  ", style="dim")
         ctrls.append("[t] Trans  |  ", style="dim")
         ctrls.append("[/] Search  |  ", style="dim")
         ctrls.append("[q] Quit", style="bold red")
@@ -1457,16 +1481,16 @@ class MainChatsTUI:
                 self.rebuild_tree()
                 continue
 
-            # Always scroll preview with bracket / shift keys
-            if k in ("]", "J"):
-                self.preview_scroll_offset += 3
+            # Direct preview scrolling with J / K anytime
+            if k == "J":
+                self.preview_scroll_offset += 4
                 continue
-            elif k in ("[", "K"):
-                self.preview_scroll_offset = max(0, self.preview_scroll_offset - 3)
+            elif k == "K":
+                self.preview_scroll_offset = max(0, self.preview_scroll_offset - 4)
                 continue
 
             # -------------------------------------------------------------
-            # PREVIEW FOCUS (Default: Arrow keys & j/k move PREVIEW!)
+            # PREVIEW FOCUS: Arrow keys scroll preview, Left/Right switch item
             # -------------------------------------------------------------
             if self.active_focus == "preview":
                 if k in ("UP", "k"):
@@ -1487,26 +1511,26 @@ class MainChatsTUI:
                 elif k == "END":
                     self.preview_scroll_offset = 999999
                     continue
-                elif k in ("LEFT",):
+                elif k in ("LEFT", "["):
                     if self.group_by_dir:
                         if self.tree_cursor > 0:
                             self.tree_cursor -= 1
                             self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
                             if curr_pos > 0:
                                 self.selected_idx = self.visible_indices[curr_pos - 1]
                                 self.preview_scroll_offset = 0
                     continue
-                elif k in ("RIGHT",):
+                elif k in ("RIGHT", "]"):
                     if self.group_by_dir:
                         if self.tree_cursor < len(self.tree_items) - 1:
                             self.tree_cursor += 1
                             self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
                             if curr_pos < len(self.visible_indices) - 1:
                                 self.selected_idx = self.visible_indices[curr_pos + 1]
                                 self.preview_scroll_offset = 0
@@ -1525,51 +1549,62 @@ class MainChatsTUI:
                             continue
 
             # -------------------------------------------------------------
-            # LIST FOCUS (When Tab is pressed to navigate items)
+            # LIST FOCUS: Up/Down arrow moves selection, Left/Right pages
             # -------------------------------------------------------------
             if self.active_focus == "list":
-                if k in ("UP", "k"):
+                if k == "UP":
                     if self.group_by_dir:
                         if self.tree_cursor > 0:
                             self.tree_cursor -= 1
                             self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
                             if curr_pos > 0:
                                 self.selected_idx = self.visible_indices[curr_pos - 1]
                                 self.preview_scroll_offset = 0
                     continue
-                elif k in ("DOWN", "j"):
+                elif k == "DOWN":
                     if self.group_by_dir:
                         if self.tree_cursor < len(self.tree_items) - 1:
                             self.tree_cursor += 1
                             self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
                             if curr_pos < len(self.visible_indices) - 1:
                                 self.selected_idx = self.visible_indices[curr_pos + 1]
                                 self.preview_scroll_offset = 0
                     continue
-                elif k == "PAGE_UP":
+                # Direct preview scrolling in list mode via j / k
+                elif k == "j":
+                    self.preview_scroll_offset += 2
+                    continue
+                elif k == "k":
+                    self.preview_scroll_offset = max(0, self.preview_scroll_offset - 2)
+                    continue
+                # Page back
+                elif k in ("LEFT", "PAGE_UP", "["):
                     if self.group_by_dir:
                         self.tree_cursor = max(0, self.tree_cursor - self.page_size)
                         self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
-                            self.selected_idx = self.visible_indices[max(0, curr_pos - self.page_size)]
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
+                            new_pos = max(0, curr_pos - self.page_size)
+                            self.selected_idx = self.visible_indices[new_pos]
                             self.preview_scroll_offset = 0
                     continue
-                elif k == "PAGE_DOWN":
+                # Page forward
+                elif k in ("RIGHT", "PAGE_DOWN", "]"):
                     if self.group_by_dir:
                         self.tree_cursor = min(max(0, len(self.tree_items) - 1), self.tree_cursor + self.page_size)
                         self.preview_scroll_offset = 0
                     else:
                         if self.visible_indices:
-                            curr_pos = self.visible_indices.index(self.selected_idx)
-                            self.selected_idx = self.visible_indices[min(len(self.visible_indices) - 1, curr_pos + self.page_size)]
+                            curr_pos = self.visible_indices.index(self.selected_idx) if self.selected_idx in self.visible_indices else 0
+                            new_pos = min(len(self.visible_indices) - 1, curr_pos + self.page_size)
+                            self.selected_idx = self.visible_indices[new_pos]
                             self.preview_scroll_offset = 0
                     continue
                 elif k == "HOME":
@@ -1600,24 +1635,6 @@ class MainChatsTUI:
                             self.rebuild_tree()
                             self.preview_scroll_offset = 0
                             continue
-                elif k == "LEFT":
-                    if self.group_by_dir and self.tree_items:
-                        sel_item = self.tree_items[self.tree_cursor]
-                        if sel_item["type"] == "dir" and sel_item["dir_key"] in self.expanded_dirs:
-                            self.expanded_dirs.remove(sel_item["dir_key"])
-                            self.rebuild_tree()
-                            self.preview_scroll_offset = 0
-                            continue
-                elif k == "RIGHT":
-                    if self.group_by_dir and self.tree_items:
-                        sel_item = self.tree_items[self.tree_cursor]
-                        if sel_item["type"] == "dir" and sel_item["dir_key"] not in self.expanded_dirs:
-                            self.expanded_dirs.add(sel_item["dir_key"])
-                            self.rebuild_tree()
-                            self.preview_scroll_offset = 0
-                            continue
-                    self.active_focus = "preview"
-                    continue
 
             # Global actions
             if k in ("/",):
