@@ -8,3 +8,6 @@ build/
 env/
 venv/
 .pytest_cache/
+
+# Junction to global skills dir - never track
+.agents/
