@@ -24,9 +24,10 @@ import subprocess
 import shutil
 from typing import List, Dict, Optional, Tuple, Any, Set
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.text import Text
 from rich import box
 from rich.markup import escape
@@ -41,12 +42,27 @@ from session_engine import (
     parse_time,
     format_relative,
     copy_to_clipboard,
+    load_preview_view,
+    toggle_preview_view,
+    build_resume_cmd,
     DEFAULT_CONV_DIR,
     DEFAULT_BRAIN_DIR,
     DEFAULT_SUMMARIES_DB
 )
 
 console = Console()
+
+PREVIEW_REPLY_MAX_LINES = 8
+
+
+def show_resume_command(cid: str):
+    """Prints the resume command for a conversation (plain, so it never gets line-wrapped) and copies it."""
+    cmd = build_resume_cmd(cid)
+    copied = copy_to_clipboard(cmd)
+    os.system("cls" if os.name == "nt" else "clear")
+    console.print("[bold green]Resume command[/bold green]" + (" [dim](copied to clipboard)[/dim]" if copied else "") + ":\n")
+    sys.stdout.write(cmd + "\n")
+    sys.stdout.flush()
 
 
 # ==============================================================================
@@ -707,10 +723,33 @@ class TurnExplorerTUI:
 # Live Conversation Preview Builder (Split Screen Right Pane)
 # ==============================================================================
 
-def build_conversation_preview_lines(cid: str, row_data: Tuple, max_width: int = 65) -> List[Text]:
-    """Builds formatted lines for the right-hand scrollable preview pane."""
+def _preview_view_chips(view: Dict[str, bool]) -> Text:
+    """'View: ☑ Prompts  ☑ Tools  ☐ Replies' status line (prompts are always on)."""
+    chips = Text("View:      ", style="bold")
+    chips.append("☑ Prompts", style="bold green")
+    for key, label in (("tools", "Tools"), ("replies", "Replies")):
+        on = view.get(key, False)
+        chips.append("  ")
+        chips.append(f"{'☑' if on else '☐'} {label}", style="bold green" if on else "dim")
+    return chips
+
+
+def build_conversation_preview_lines(
+    cid: str,
+    row_data: Tuple,
+    max_width: int = 65,
+    view: Optional[Dict[str, bool]] = None
+) -> List[Text]:
+    """Builds formatted lines for the right-hand scrollable preview pane.
+
+    Prompts are always shown; view["tools"] / view["replies"] switch the extras on or off.
+    """
     lines: List[Text] = []
     cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row_data
+    if view is None:
+        view = load_preview_view()
+    show_tools = bool(view.get("tools"))
+    show_replies = bool(view.get("replies"))
 
     dt = parse_time(last_mod)
     rel_time = format_relative(dt)
@@ -778,63 +817,50 @@ def build_conversation_preview_lines(cid: str, row_data: Tuple, max_width: int =
     t_ws = Text("Workspace: ", style="bold")
     t_ws.append(ws_str, style="green")
     lines.append(t_ws)
+    lines.append(_preview_view_chips(view))
     lines.append(Text(""))
 
-    # 3. Turns & Content
+    # 3. Turns & Content: prompts always; tool calls / assistant replies per the view switches,
+    #    interleaved in the order they happened.
     if turns:
-        # Initial user request
-        lines.append(Text("▶ INITIAL USER REQUEST:", style="bold yellow"))
-        init_lines = turns[0]["user_text"].strip().splitlines()
-        for l in init_lines:
-            t = Text("  │ ", style="dim")
-            t.append(l, style="white")
-            lines.append(t)
-        lines.append(Text(""))
-
-        # Assistant response for Turn 1
-        if turns[0].get("assistant_text"):
-            lines.append(Text("▶ ASSISTANT RESPONSE:", style="bold green"))
-            for l in turns[0]["assistant_text"].strip().splitlines():
-                t = Text("  │ ", style="dim")
-                t.append(l, style="dim white")
-                lines.append(t)
-            lines.append(Text(""))
-
-        if turns[0].get("tools"):
-            t_tools = Text("  ▶ Tools Executed (", style="bold cyan")
-            t_tools.append(f"{len(turns[0]['tools'])} tools): ", style="bold cyan")
-            tool_badges = [tl.get("short_label", tl["tool_name"]) for tl in turns[0]["tools"][:3]]
-            t_tools.append(", ".join(tool_badges), style="yellow")
-            if len(turns[0]["tools"]) > 3:
-                t_tools.append(f" +{len(turns[0]['tools']) - 3} more", style="dim")
-            lines.append(t_tools)
-            lines.append(Text(""))
-
-        # Subsequent turns
-        for turn in turns[1:]:
-            lines.append(Text(f"▶ USER TURN #{turn['turn_index']}:", style="bold yellow"))
+        for turn in turns:
+            n = turn["turn_index"]
+            head = "▶ INITIAL USER REQUEST:" if n == 1 else f"▶ USER TURN #{n}:"
+            lines.append(Text(head, style="bold yellow"))
             for l in turn["user_text"].strip().splitlines():
                 t = Text("  │ ", style="dim")
                 t.append(l, style="white")
                 lines.append(t)
             lines.append(Text(""))
 
-            if turn.get("assistant_text"):
-                lines.append(Text(f"▶ ASSISTANT (Turn #{turn['turn_index']}):", style="bold green"))
-                for l in turn["assistant_text"].strip().splitlines():
-                    t = Text("  │ ", style="dim")
-                    t.append(l, style="dim white")
-                    lines.append(t)
-                lines.append(Text(""))
+            if not (show_tools or show_replies):
+                continue
 
-            if turn.get("tools"):
-                t_tools = Text("  ▶ Tools (", style="bold cyan")
-                t_tools.append(f"{len(turn['tools'])} tools): ", style="bold cyan")
-                tool_badges = [tl.get("short_label", tl["tool_name"]) for tl in turn["tools"][:3]]
-                t_tools.append(", ".join(tool_badges), style="yellow")
-                if len(turn["tools"]) > 3:
-                    t_tools.append(f" +{len(turn['tools']) - 3} more", style="dim")
-                lines.append(t_tools)
+            wrote_any = False
+            prev_kind = None
+            for kind, val in turn.get("events", []):
+                if kind == "reply" and show_replies:
+                    if prev_kind == "tool":
+                        lines.append(Text(""))
+                    lines.append(Text("▶ ASSISTANT:", style="bold green"))
+                    reply_lines = val.strip().splitlines()
+                    for l in reply_lines[:PREVIEW_REPLY_MAX_LINES]:
+                        t = Text("  │ ", style="dim")
+                        t.append(l, style="dim white")
+                        lines.append(t)
+                    if len(reply_lines) > PREVIEW_REPLY_MAX_LINES:
+                        lines.append(Text(f"  │ … [{len(reply_lines) - PREVIEW_REPLY_MAX_LINES} more lines]", style="dim"))
+                    lines.append(Text(""))
+                    wrote_any = True
+                    prev_kind = "reply"
+                elif kind == "tool" and show_tools:
+                    t = Text("  ▸ ", style="cyan")
+                    t.append(f"#{val.get('tool_number', '?')} ", style="dim")
+                    t.append(val.get("short_label", val["tool_name"]), style="yellow")
+                    lines.append(t)
+                    wrote_any = True
+                    prev_kind = "tool"
+            if wrote_any and prev_kind == "tool":
                 lines.append(Text(""))
     elif prev:
         lines.append(Text("▶ PREVIEW SNIPPET:", style="bold yellow"))
@@ -948,6 +974,57 @@ def build_directory_preview_lines(dir_name: str, dir_path: str, rows_in_dir: Lis
     return wrap_text_lines(lines, max_width)
 
 
+def run_move_flow(cid: str, rows: Optional[List[Any]] = None):
+    """Interactive 'relocate conversation workspace' screen (shared by the Rich TUI and the fzf shell)."""
+    title = cid[:8]
+    curr_ws = "~"
+    for r in (rows or []):
+        if r[0] == cid:
+            title = r[1] or cid[:8]
+            curr_ws = format_workspace_path(r[5])
+            break
+
+    os.system("cls" if os.name == "nt" else "clear")
+    menu = Text()
+    menu.append(f"Move Conversation: {title} ({cid[:8]})\n\n", style="bold yellow")
+    menu.append(f"Current Workspace: {curr_ws}\n\n", style="cyan")
+
+    known = list_workspaces()
+    menu.append("Known Workspaces:\n", style="bold green")
+    for i, w in enumerate(known[:5], 1):
+        menu.append(f"  [{i}] {w['label']} ({w['path']}) [{w['count']} convs]\n", style="white")
+
+    menu.append("\n  [c] Custom Path\n  [Esc] Cancel\n", style="bold cyan")
+    console.print(Panel(menu, title="[bold]Relocate Conversation Workspace[/bold]", border_style="yellow"))
+    console.print("[bold]Select an option [1-5, c]:[/bold] ", end="")
+    sys.stdout.flush()
+
+    while True:
+        k = get_key()
+        if k in ("1", "2", "3", "4", "5"):
+            idx = int(k) - 1
+            if idx < len(known[:5]):
+                target_ws = known[idx]["path"]
+                break
+        elif k in ("c", "C"):
+            console.print()
+            target_ws = prompt_input("Enter target workspace path (e.g. E:\\JB):")
+            if not target_ws:
+                return
+            break
+        elif k in ("ESC", "q", "Q"):
+            return
+
+    console.print(f"\n[bold green]Moving conversation to '{target_ws}'...[/bold green]")
+    ok, msg = move_conversation_workspace(cid, target_ws)
+    if ok:
+        console.print(f"[bold green]Success:[/bold green] {msg}")
+    else:
+        console.print(f"[bold red]Failed:[/bold red] {msg}")
+    console.print("\nPress any key to continue...")
+    get_key()
+
+
 # ==============================================================================
 # MainChatsTUI: Master Conversation Explorer, Forker & Workspace Manager
 # ==============================================================================
@@ -960,8 +1037,15 @@ class MainChatsTUI:
         default_action: str = "resume",
         target_turn: Optional[int] = None,
         limit: int = 0,
-        group_by_dir: bool = False
+        group_by_dir: bool = False,
+        launch: bool = False
     ):
+        self.launch = launch  # True = actually start `agy` on resume (and exit) instead of just handing back the command
+        self.preview_view = load_preview_view()
+        self.status_cmd = ""
+        self.status_copied = False
+        self.resume_log: List[str] = []
+        self.show_output_area = True  # bottom ~25% resume-commands area (off for the plain session picker)
         self.show_all = show_all
         self.filter_query = initial_query.strip()
         self.default_action = default_action
@@ -1109,6 +1193,106 @@ class MainChatsTUI:
             console.print("[bold red]Invalid number. Limit unchanged.[/bold red]")
             get_key()
 
+    def _get_preview_lines(self, row: Tuple, width: int) -> List[Text]:
+        """Cached preview for a conversation, keyed on everything that changes its content."""
+        key = (row[0], self.preview_view["tools"], self.preview_view["replies"], width)
+        if key not in self.preview_cache:
+            self.preview_cache[key] = build_conversation_preview_lines(
+                row[0], row, max_width=width, view=self.preview_view
+            )
+        return self.preview_cache[key]
+
+    def toggle_preview(self, key: str):
+        """Flips the 'tools' / 'replies' preview switch, persists it, and re-renders from the top."""
+        self.preview_view = toggle_preview_view(key)
+        self.preview_scroll_offset = 0
+
+    def _resume(self, cid: str) -> bool:
+        """Resume a conversation. Returns True if the browser should exit.
+
+        Default: copy the resume command, show it in the status line, and KEEP RUNNING (so you can
+        grab more commands). With --launch: start agy directly, then exit (the old behavior).
+        """
+        cmd = build_resume_cmd(cid)
+        if self.launch:
+            console.print(f"\n[bold green]Resuming conversation [cyan]{cid}[/cyan]...[/bold green]\n")
+            if sys.platform == "win32":
+                subprocess.run(cmd, shell=True)
+            else:
+                os.execvp("agy", ["agy", "--conversation", cid])
+            return True
+        self.status_cmd = cmd
+        self.status_copied = copy_to_clipboard(cmd)
+        if cmd not in self.resume_log:
+            self.resume_log.append(cmd)
+        return False
+
+    def _layout_budget(self, term_lines: int) -> Tuple[int, int]:
+        """(main_h, out_h): rows for the browser (~75%) and for the resume-commands area (~25%).
+
+        One row is always left free below the frame so the cursor never scrolls the screen. The browser
+        never gets squeezed below what it needs (header + 5-row list + controls); on very short terminals
+        the output area shrinks (below 3 rows it falls back to a one-line status).
+        """
+        usable = max(8, term_lines - 1)
+        if not self.show_output_area:
+            return usable, 0
+        main_h = max(int(usable * 0.75), min(usable, 18))
+        return main_h, usable - main_h
+
+    def _render_status(self):
+        """One-line fallback for terminals too short to fit the output area."""
+        if not self.status_cmd:
+            return
+        line = Text("✔ Resume command" + (" (copied)" if self.status_copied else "") + ": ", style="bold green")
+        line.append(self.status_cmd, style="bold cyan")
+        console.print(line, soft_wrap=True)
+
+    def _render_output_area(self, pad_rows: int, out_h: int):
+        """Bottom ~25% of the screen: resume commands handed out so far, newest last.
+
+        Plain unbordered lines on purpose: no box characters to catch in a mouse selection, and each
+        command is one unbroken line (soft_wrap) so a drag-select copies it intact.
+        """
+        if out_h <= 0:
+            return
+        for _ in range(pad_rows):
+            console.print()
+        if out_h < 3:
+            self._render_status()
+            return
+
+        if self.resume_log:
+            note = "newest is on your clipboard" if self.status_copied else "clipboard unavailable - select & copy"
+        else:
+            note = "nothing yet"
+        console.print(Rule(Text(f" Resume commands ({note}) ", style="bold green"), style="green"))
+
+        body_rows = out_h - 1
+        if not self.resume_log:
+            key = "Enter or r" if self.default_action == "resume" else "r"
+            console.print(Text(f"Press {key} on a conversation: its resume command is copied and listed here.", style="dim"))
+            return
+
+        cmds = self.resume_log
+        hidden = 0
+        if len(cmds) > body_rows:
+            hidden = len(cmds) - (body_rows - 1)
+            cmds = cmds[hidden:]
+            console.print(Text(f"... {hidden} older (all reprinted when you quit)", style="dim"))
+        for i, cmd in enumerate(cmds):
+            newest = (i == len(cmds) - 1)
+            console.print(Text(cmd, style="bold cyan" if newest else "white"), soft_wrap=True)
+
+    def _print_resume_log(self):
+        """On exit, reprint every resume command handed out (the screen is redrawn constantly)."""
+        if not self.resume_log:
+            return
+        console.print("\n[bold green]Resume commands from this session:[/bold green]")
+        for cmd in self.resume_log:
+            sys.stdout.write(cmd + "\n")
+        sys.stdout.flush()
+
     def _get_selected_cid(self) -> Optional[str]:
         if self.group_by_dir and self.tree_items:
             sel_item = self.tree_items[self.tree_cursor]
@@ -1138,9 +1322,10 @@ class MainChatsTUI:
             mode_str = "All (incl. subagents)" if self.show_all else "Main Chats Only"
             header_text.append(f"Mode: {mode_str} ('a' to toggle)\n", style="bold yellow")
 
-        grp_status = "[bold green]ON[/bold green]" if self.group_by_dir else "[dim]OFF[/dim]"
         header_text.append(f"Total: {len(self.rows)}  |  ", style="dim")
-        header_text.append(f"Grouped Dirs: {grp_status} ('g')  |  ", style="white")
+        header_text.append("Grouped Dirs: ", style="white")
+        header_text.append("ON" if self.group_by_dir else "OFF", style="bold green" if self.group_by_dir else "dim")
+        header_text.append(" ('g')  |  ", style="white")
 
         if self.limit_count > 0:
             header_text.append(f"Showing: Top {self.limit_count} ('#' to change)  |  ", style="bold yellow")
@@ -1153,15 +1338,33 @@ class MainChatsTUI:
             header_text.append("Filter: None (press '/' to search)", style="dim")
 
         border_c = "green" if self.default_action == "tool" else "cyan"
-        console.print(Panel(header_text, border_style=border_c, box=box.ROUNDED))
+        header_panel = Panel(header_text, border_style=border_c, box=box.ROUNDED)
+
+        main_h, out_h = self._layout_budget(term_lines)
 
         if not self.visible_indices and not (self.group_by_dir and self.tree_items):
-            console.print(Panel(f"[bold red]No conversations matching '{escape(self.filter_query)}'.[/bold red]", border_style="red"))
-            self.render_controls()
+            empty_group = Group(
+                header_panel,
+                Panel(f"[bold red]No conversations matching '{escape(self.filter_query)}'.[/bold red]", border_style="red"),
+                self._controls_text(),
+            )
+            used = len(console.render_lines(empty_group))
+            console.print(empty_group)
+            self._render_output_area(max(0, main_h - used), out_h)
             return
 
-        # Height budgeted strictly to avoid terminal window vertical overflow:
-        # 10 item rows + table header = 14 lines content height
+        # Height budget: the browser gets ~75% of the rows (main_h); the rest is the resume-commands area.
+        # Measure the real header/controls heights (they wrap on narrow terminals), give everything else to the
+        # list/preview panels, and derive how many conversations fit on a page from that.
+        hdr_h = len(console.render_lines(header_panel))
+        ctl_h = len(console.render_lines(self._controls_text()))
+        grid_h = main_h - hdr_h - ctl_h
+        if term_cols >= 85:
+            avail_h = max(9, grid_h - 2)               # one row of panels: 2 border rows
+        else:
+            avail_h = max(7, (grid_h - 4) // 2)        # list + preview stacked: 2 borders each
+        # list table = blank + header + rule + page rows + blank  ->  avail_h = page_size + 4
+        self.page_size = max(3, avail_h - 4)
         avail_h = self.page_size + 4
 
         # -------------------------------------------------------------
@@ -1309,17 +1512,11 @@ class MainChatsTUI:
                 all_preview_lines = self.dir_preview_cache[d_key]
             else:
                 sel_row = sel_item["row"]
-                sel_cid = sel_row[0]
-                if sel_cid not in self.preview_cache:
-                    self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
-                all_preview_lines = self.preview_cache[sel_cid]
+                all_preview_lines = self._get_preview_lines(sel_row, preview_w)
         else:
             if self.visible_indices:
                 sel_row = self.rows[self.selected_idx]
-                sel_cid = sel_row[0]
-                if sel_cid not in self.preview_cache:
-                    self.preview_cache[sel_cid] = build_conversation_preview_lines(sel_cid, sel_row, max_width=preview_w)
-                all_preview_lines = self.preview_cache[sel_cid]
+                all_preview_lines = self._get_preview_lines(sel_row, preview_w)
             else:
                 all_preview_lines = [Text("No conversation selected.", style="dim")]
 
@@ -1347,15 +1544,17 @@ class MainChatsTUI:
         else:
             p_title.append("Preview ", style="bold")
 
-        if self.preview_scroll_offset > 0:
-            p_title.append(f"(▲ {self.preview_scroll_offset} lines above - j/k to scroll)", style="bold yellow")
-        else:
-            p_title.append("Details", style="dim")
+        for key_hint, label, flag in (("1", "Tools", "tools"), ("2", "Replies", "replies")):
+            on = self.preview_view.get(flag, False)
+            p_title.append(f" [{key_hint}]{label} ", style="bold green" if on else "dim")
+            p_title.append("☑" if on else "☐", style="bold green" if on else "dim")
 
         p_sub = Text()
         remaining_lines = max(0, len(all_preview_lines) - (self.preview_scroll_offset + avail_h))
+        if self.preview_scroll_offset > 0:
+            p_sub.append(f"▲ {self.preview_scroll_offset} above  ", style="bold yellow")
         if remaining_lines > 0:
-            p_sub.append(f"▼ {remaining_lines} lines below (use j/k to scroll)", style="bold yellow")
+            p_sub.append(f"▼ {remaining_lines} below (j/k to scroll)", style="bold yellow")
         else:
             p_sub.append("(End of Preview)", style="dim")
 
@@ -1368,14 +1567,22 @@ class MainChatsTUI:
             grid.add_column("left", ratio=7, min_width=50)
             grid.add_column("right", ratio=5, min_width=38)
             grid.add_row(left_panel, right_panel)
-            console.print(grid)
+            body = grid
         else:
-            console.print(left_panel)
-            console.print(right_panel)
+            body = Group(left_panel, right_panel)
 
-        self.render_controls()
+        main_group = Group(header_panel, body, self._controls_text())
+        used = len(console.render_lines(main_group))
+        console.print(main_group)
+        if used > main_h:
+            # The browser needs more than its 75% share (short/narrow terminal): give the output area only
+            # what's genuinely left, or - if there isn't room for a rule + a line - the one-line status.
+            remaining = max(8, term_lines - 1) - used
+            out_h = min(out_h, remaining) if remaining >= 3 else 2
+        # Anchor the resume-commands area to the bottom ~25%
+        self._render_output_area(max(0, main_h - used), out_h)
 
-    def render_controls(self):
+    def _controls_text(self) -> Text:
         ctrls = Text()
         if self.active_focus == "preview":
             ctrls.append(" [PREVIEW] ", style="bold black on green")
@@ -1391,75 +1598,44 @@ class MainChatsTUI:
             ctrls.append("[j/k] Scroll  |  ", style="dim green")
             ctrls.append("[Tab] Focus Preview  |  ", style="green")
 
+        ctrls.append("[1] Tools  [2] Replies  |  ", style="bold green")
         ctrls.append("[g] Group  |  ", style="bold magenta")
         ctrls.append("[#] Limit  |  ", style="bold yellow")
-        ctrls.append("[Enter] Resume  |  ", style="bold green")
+        ctrls.append("[Enter] Copy Resume Cmd  |  ", style="bold green")
         ctrls.append("[f] Fork  |  ", style="cyan")
         ctrls.append("[t] Trans  |  ", style="dim")
         ctrls.append("[/] Search  |  ", style="dim")
         ctrls.append("[q] Quit", style="bold red")
-        console.print(ctrls)
+        return ctrls
+
+    def render_controls(self):
+        console.print(self._controls_text())
 
     def interactive_move(self):
         cid = self._get_selected_cid()
         if not cid: return
-
-        # Lookup title and workspace
-        title = cid[:8]
-        curr_ws = "~"
-        for r in self.rows:
-            if r[0] == cid:
-                title = r[1] or cid[:8]
-                curr_ws = format_workspace_path(r[5])
-                break
-
-        os.system("cls" if os.name == "nt" else "clear")
-        menu = Text()
-        menu.append(f"Move Conversation: {title} ({cid[:8]})\n\n", style="bold yellow")
-        menu.append(f"Current Workspace: {curr_ws}\n\n", style="cyan")
-
-        known = list_workspaces()
-        menu.append("Known Workspaces:\n", style="bold green")
-        for i, w in enumerate(known[:5], 1):
-            menu.append(f"  [{i}] {w['label']} ({w['path']}) [{w['count']} convs]\n", style="white")
-
-        menu.append("\n  [c] Custom Path\n  [Esc] Cancel\n", style="bold cyan")
-        console.print(Panel(menu, title="[bold]Relocate Conversation Workspace[/bold]", border_style="yellow"))
-        console.print("[bold]Select an option [1-5, c]:[/bold] ", end="")
-        sys.stdout.flush()
-
-        while True:
-            k = get_key()
-            if k in ("1", "2", "3", "4", "5"):
-                idx = int(k) - 1
-                if idx < len(known[:5]):
-                    target_ws = known[idx]["path"]
-                    break
-            elif k in ("c", "C"):
-                console.print()
-                target_ws = prompt_input("Enter target workspace path (e.g. E:\\JB):")
-                if not target_ws: return
-                break
-            elif k in ("ESC", "q", "Q"):
-                return
-
-        console.print(f"\n[bold green]Moving conversation to '{target_ws}'...[/bold green]")
-        ok, msg = move_conversation_workspace(cid, target_ws)
-        if ok:
-            console.print(f"[bold green]Success:[/bold green] {msg}")
-        else:
-            console.print(f"[bold red]Failed:[/bold red] {msg}")
-        console.print("\nPress any key to continue...")
-        get_key()
+        run_move_flow(cid, self.rows)
         self.refresh_data()
 
     def run(self):
+        try:
+            self._loop()
+        finally:
+            self._print_resume_log()
+
+    def _loop(self):
         while True:
             self.render()
             k = get_key()
 
             # Global toggles
-            if k in ("g", "G"):
+            if k == "1":
+                self.toggle_preview("tools")
+                continue
+            elif k == "2":
+                self.toggle_preview("replies")
+                continue
+            elif k in ("g", "G"):
                 self.group_by_dir = not self.group_by_dir
                 self.rebuild_tree()
                 self.preview_scroll_offset = 0
@@ -1675,12 +1851,7 @@ class MainChatsTUI:
                     get_key()
             elif k in ("r", "R"):
                 cid = self._get_selected_cid()
-                if cid:
-                    console.print(f"\n[bold green]Resuming conversation [cyan]{cid}[/cyan]...[/bold green]\n")
-                    if sys.platform == "win32":
-                        subprocess.run(f"agy --conversation {cid}", shell=True)
-                    else:
-                        os.execvp("agy", ["agy", "--conversation", cid])
+                if cid and self._resume(cid):
                     return
             elif k in ("ENTER",):
                 if self.group_by_dir and self.tree_items:
@@ -1710,12 +1881,8 @@ class MainChatsTUI:
                             show_success_screen(res)
                             return
                     else:
-                        console.print(f"\n[bold green]Resuming conversation [cyan]{cid}[/cyan]...[/bold green]\n")
-                        if sys.platform == "win32":
-                            subprocess.run(f"agy --conversation {cid}", shell=True)
-                        else:
-                            os.execvp("agy", ["agy", "--conversation", cid])
-                        return
+                        if self._resume(cid):
+                            return
             elif k == "ESC":
                 if self.filter_query:
                     self.update_filter("")
@@ -1733,11 +1900,16 @@ def run_conversation_picker(prompt_title: str = "Select Conversation") -> Option
         tui = MainChatsTUI(show_all=True)
     if not tui.rows:
         return None
+    tui.show_output_area = False  # picker returns the chosen id; no resume-commands area needed
 
     while True:
         tui.render()
         k = get_key()
-        if k in ("UP", "k"):
+        if k == "1":
+            tui.toggle_preview("tools")
+        elif k == "2":
+            tui.toggle_preview("replies")
+        elif k in ("UP", "k"):
             if tui.visible_indices:
                 curr_pos = tui.visible_indices.index(tui.selected_idx)
                 if curr_pos > 0:

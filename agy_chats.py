@@ -26,12 +26,13 @@ import re
 import argparse
 import subprocess
 import shutil
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.markup import escape
+from rich.text import Text
 from rich import box
 
 from session_engine import (
@@ -44,6 +45,10 @@ from session_engine import (
     parse_time,
     format_relative,
     copy_to_clipboard,
+    load_preview_view,
+    toggle_preview_view,
+    parse_preview_view,
+    build_resume_cmd,
     DEFAULT_SUMMARIES_DB,
     DEFAULT_BRAIN_DIR,
     DEFAULT_CONV_DIR
@@ -54,9 +59,14 @@ from tui import (
     ToolCutterTUI,
     show_success_screen,
     show_transcript_pager,
+    show_resume_command,
+    run_move_flow,
+    normalize_dir,
+    build_directory_preview_lines,
     build_conversation_preview_lines,
     run_conversation_picker
 )
+import fzf_ui
 
 console = Console()
 
@@ -112,22 +122,25 @@ def resolve_conversation(query: Optional[str]) -> Optional[str]:
     return q
 
 
-def resume_conversation(cid: str):
-    """Resumes an Antigravity conversation."""
+def resume_conversation(cid: str, launch: bool = False):
+    """Hands back the resume command for an Antigravity conversation (launches agy only with launch=True)."""
+    if not launch:
+        show_resume_command(cid)
+        return
     console.print(f"\n[bold green]Resuming conversation [cyan]{cid}[/cyan]...[/bold green]\n")
     if sys.platform == "win32":
-        subprocess.run(f"agy --conversation {cid}", shell=True)
+        subprocess.run(build_resume_cmd(cid), shell=True)
     else:
         os.execvp("agy", ["agy", "--conversation", cid])
 
 
-def resume_latest():
-    """Immediately resumes the most recent conversation."""
+def resume_latest(launch: bool = False):
+    """Resumes (prints the resume command for) the most recent conversation."""
     cid = resolve_conversation(None)
     if not cid:
         console.print("[bold red]No conversations found to resume.[/bold red]")
         sys.exit(1)
-    resume_conversation(cid)
+    resume_conversation(cid, launch=launch)
 
 
 def list_table(show_all: bool = False):
@@ -244,134 +257,187 @@ def print_tools_table(reader: SessionReader, turn_num: Optional[int] = None):
 
 
 # ==============================================================================
-# FZF Integration (When fzf is installed or --fzf is passed)
+# FZF shell (claude-chats look): fzf in the top ~75%, shortcut bar + resume commands in the bottom ~25%
 # ==============================================================================
 
-def run_fzf_tui(initial_query: str = "", show_all: bool = False):
-    """Launches fzf with live side-by-side preview window if fzf is installed."""
-    script_path = os.path.abspath(__file__)
-    current_show_all = show_all
+_AGY_SELECT = """
+    SELECT conversation_id, title, preview, step_count, last_modified_time,
+           workspace_uris, agent_name, nesting_depth, parent_conversation_id
+    FROM conversation_summaries {where} ORDER BY last_modified_time DESC
+"""
 
-    while True:
-        if not os.path.exists(DEFAULT_SUMMARIES_DB):
-            console.print("[bold red]Database not found.[/bold red]")
-            return
 
-        conn = sqlite3.connect(DEFAULT_SUMMARIES_DB)
-        cur = conn.cursor()
-        if current_show_all:
-            cur.execute("""
-                SELECT conversation_id, title, preview, step_count, last_modified_time,
-                       workspace_uris, agent_name, nesting_depth, parent_conversation_id
-                FROM conversation_summaries ORDER BY last_modified_time DESC
-            """)
-        else:
-            cur.execute("""
-                SELECT conversation_id, title, preview, step_count, last_modified_time,
-                       workspace_uris, agent_name, nesting_depth, parent_conversation_id
-                FROM conversation_summaries WHERE nesting_depth = 0 AND step_count > 0
-                ORDER BY last_modified_time DESC
-            """)
-        rows = cur.fetchall()
+def _query_rows(show_all: bool) -> List[Any]:
+    if not os.path.exists(DEFAULT_SUMMARIES_DB):
+        return []
+    conn = sqlite3.connect(DEFAULT_SUMMARIES_DB)
+    try:
+        where = "" if show_all else "WHERE nesting_depth = 0 AND step_count > 0"
+        return conn.execute(_AGY_SELECT.format(where=where)).fetchall()
+    finally:
         conn.close()
 
-        if not rows and not current_show_all:
-            current_show_all = True
-            continue
 
-        lines = []
-        for row in rows:
-            cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id = row
-            dt = parse_time(last_mod)
-            rel_time = format_relative(dt)
-            workspace = format_workspace_path(ws_uris)
-            effective_title = (title or "").strip()
-            if not effective_title:
-                if agent_name:
-                    effective_title = f"[{agent_name}]"
-                elif prev:
-                    effective_title = prev.strip().splitlines()[0][:50]
-                else:
-                    effective_title = "(Untitled Session)"
+def build_fzf_items(state: Dict[str, Any]) -> Tuple[str, int]:
+    """fzf input for the conversation list, honoring state: show_all, limit (newest N) and group (by folder)."""
+    show_all = bool(state.get("show_all"))
+    rows = _query_rows(show_all)
+    if not rows and not show_all:
+        rows = _query_rows(True)
 
-            short_id = cid[:8]
+    entries = []
+    for cid, title, prev, step_count, last_mod, ws_uris, agent_name, depth, parent_id in rows:
+        rel_time = format_relative(parse_time(last_mod))
+        workspace = format_workspace_path(ws_uris)
+        effective_title = (title or "").strip()
+        if not effective_title:
             if agent_name:
-                tag = "\033[35m[agent]\033[0m"
+                effective_title = f"[{agent_name}]"
+            elif prev:
+                effective_title = prev.strip().splitlines()[0][:50]
             else:
-                tag = "\033[32m●\033[0m"
+                effective_title = "(Untitled Session)"
+        effective_title = effective_title.replace("\t", " ")
 
-            display_col = (
-                f"{tag} \033[36m{short_id}\033[0m  "
-                f"\033[1;37m{effective_title:<38}\033[0m  "
-                f"\033[33m{rel_time:<10}\033[0m  "
-                f"\033[34m{step_count:>3} steps\033[0m  "
-                f"\033[2m{workspace}\033[0m"
-            )
-            lines.append(f"{cid}\t{display_col}")
-
-        input_data = "\n".join(lines)
-        mode_str = "All Sessions (incl. subagents)" if current_show_all else "Main Chats Only"
-        header = (
-            f"Mode: {mode_str}\n"
-            "ENTER: Continue Chat | CTRL-T: Full Transcript | CTRL-Y: Copy ID | CTRL-A: Toggle All | ESC: Quit"
+        tag = "\033[35m[agent]\033[0m" if agent_name else "\033[32m●\033[0m"
+        display_col = (
+            f"{tag} \033[36m{cid[:8]}\033[0m  "
+            f"\033[1;37m{effective_title:<38}\033[0m  "
+            f"\033[33m{rel_time:<10}\033[0m  "
+            f"\033[34m{step_count:>3} steps\033[0m  "
+            f"\033[2m{workspace}\033[0m"
         )
+        dir_label, dir_path = normalize_dir(ws_uris)
+        entries.append((cid, display_col, dir_label, dir_label, dir_path))
+    return fzf_ui.assemble_items(entries, state)
 
-        fzf_cmd = [
-            "fzf",
-            "--ansi",
-            "--delimiter=\t",
-            "--with-nth=2..",
-            f"--preview=python \"{script_path}\" --preview {{1}}",
-            "--preview-window=right:52%:wrap",
-            f"--header={header}",
-            "--prompt=Resume Chat > ",
-            "--expect=ctrl-t,ctrl-y,ctrl-a,enter",
-            "--height=90%",
-            "--border=rounded",
-            "--info=inline",
-        ]
-        if initial_query:
-            fzf_cmd.append(f"--query={initial_query}")
-            initial_query = ""
 
-        try:
-            proc = subprocess.Popen(
-                fzf_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-                shell=(sys.platform == "win32")
-            )
-            stdout, _ = proc.communicate(input=input_data)
-        except Exception:
-            app = MainChatsTUI(show_all=current_show_all, initial_query=initial_query)
-            app.run()
-            return
+def dir_preview_lines(group_id: str) -> List[Text]:
+    """Overview of one workspace folder (the preview for a folder row in grouped mode)."""
+    rows = [r for r in _query_rows(True) if r[7] == 0 and r[3] > 0 and normalize_dir(r[5])[0] == group_id]
+    path = normalize_dir(rows[0][5])[1] if rows else ""
+    return build_directory_preview_lines(group_id, path, rows, max_width=66)
 
-        if proc.returncode != 0 and not stdout:
-            return
 
-        out_lines = stdout.strip().splitlines()
-        if not out_lines:
-            return
+def _log_cmd(st: Dict[str, Any], cmd: Optional[str]):
+    """Adds a command to the resume-commands area (newest last)."""
+    if not cmd:
+        return
+    if cmd in st["cmds"]:
+        st["cmds"].remove(cmd)
+    st["cmds"].append(cmd)
+    st["copied"] = True
 
-        key_pressed = out_lines[0].strip() if len(out_lines) >= 2 else "enter"
-        chosen_line = out_lines[1] if len(out_lines) >= 2 else out_lines[0]
-        cid = chosen_line.split("\t")[0].strip()
 
-        if key_pressed == "ctrl-a":
-            current_show_all = not current_show_all
-            continue
-        elif key_pressed == "ctrl-y":
-            copy_to_clipboard(cid)
-            console.print(f"[bold green]Copied UUID {cid} to clipboard![/bold green]")
-            return
-        elif key_pressed == "ctrl-t":
-            show_transcript_pager(cid)
-            continue
-        else:
-            resume_conversation(cid)
-            return
+def _h_fork(cid: str, st: Dict[str, Any]):
+    if not cid or fzf_ui.is_group(cid):
+        return
+    res = TurnExplorerTUI(cid).run()
+    if res:
+        show_success_screen(res)          # prints + clipboard-copies the new chat's resume command
+        _log_cmd(st, res.get("resume_cmd"))
+
+
+def _h_cut(cid: str, st: Dict[str, Any]):
+    if not cid or fzf_ui.is_group(cid):
+        return
+    res = ToolCutterTUI(cid).run()
+    if res:
+        show_success_screen(res)
+        _log_cmd(st, res.get("resume_cmd"))
+
+
+def _h_move(cid: str, st: Dict[str, Any]):
+    if cid and not fzf_ui.is_group(cid):
+        run_move_flow(cid, [r for r in _query_rows(True) if r[0] == cid])
+
+
+def _h_trans(cid: str, st: Dict[str, Any]):
+    if cid and not fzf_ui.is_group(cid):
+        show_transcript_pager(cid)
+
+
+def _h_all(arg: str, st: Dict[str, Any]):
+    st["show_all"] = not st["show_all"]
+
+
+def _h_launch(cid: str, st: Dict[str, Any]) -> str:
+    resume_conversation(cid, launch=True)
+    return "quit"
+
+
+SHELL_HANDLERS = {
+    "fork": _h_fork,
+    "cut": _h_cut,
+    "move": _h_move,
+    "trans": _h_trans,
+    "all": _h_all,
+    "launch": _h_launch,
+}
+
+
+def make_shell_config(launch: bool = False) -> "fzf_ui.ShellConfig":
+    """The agy-chats flavor of the fzf shell: keys, shortcut bar, resume command."""
+    return fzf_ui.ShellConfig(
+        script=os.path.abspath(__file__),
+        title="agy-chats",
+        prompt="Resume Chat > ",
+        bar_items=[
+            ("Enter", "Copy Resume Cmd", "bold green"),
+            ("f", "Fork", "cyan"),
+            ("T", "Tool Cut", "bold yellow"),
+            ("m", "Move", "magenta"),
+            ("t", "Trans", "white"),
+            ("y", "Copy ID", "blue"),
+            ("a", "All/Subagents", "yellow"),
+            ("g", "Group", "bold magenta"),
+            ("#", "Limit", "bold yellow"),
+            ("Space", "Fold/Unfold", "cyan", "group"),
+            ("e/c", "Expand/Collapse All", "cyan", "group"),
+            ("1", "Tools", "bold green"),
+            ("2", "Replies", "bold green"),
+            ("j/k", "Move", "dim"),
+            ("J/K", "Scroll Preview", "green"),
+            ("/", "Search", "white"),
+            ("q", "Quit", "bold red"),
+        ],
+        keys={
+            "f": "become(echo fork {1})",
+            "T": "become(echo cut {1})",
+            "m": "become(echo move {1})",
+            "t": "become(echo trans {1})",
+            "a": "become(echo all {1})",
+        },
+        resume_cmd=lambda sel: build_resume_cmd(sel) if sel else None,
+        copy=copy_to_clipboard,
+        launch=launch,
+    )
+
+
+def run_fzf_tui(initial_query: str = "", show_all: bool = False, launch: bool = False,
+                limit: int = 0, group: bool = False) -> bool:
+    """Runs the fzf shell. Returns False when the console can't be driven (caller falls back to the Rich TUI)."""
+    if not os.path.exists(DEFAULT_SUMMARIES_DB):
+        console.print("[bold red]Database not found.[/bold red]")
+        return True
+
+    def header_for(st: Dict[str, Any], count: int) -> str:
+        # one line inside the (narrow) list pane: keep it under ~70 columns or fzf truncates it
+        mode = "All (incl. subagents)" if st.get("show_all") else "Main Chats Only"
+        lim = f"Top {st['limit']}" if st.get("limit") else "All"
+        grp = "ON" if st.get("group") else "OFF"
+        return f"{mode} | {count} chats | Limit: {lim} [#] | Group: {grp} [g]"
+
+    return fzf_ui.run_shell(
+        make_shell_config(launch),
+        build_items=build_fzf_items,
+        header_for=header_for,
+        handlers=SHELL_HANDLERS,
+        show_all=show_all,
+        initial_query=initial_query,
+        limit=limit,
+        group=group,
+    )
 
 
 # ==============================================================================
@@ -511,11 +577,54 @@ def main():
         action="store_true",
         help="Force fzf TUI if fzf is installed."
     )
+    parser.add_argument(
+        "--launch",
+        action="store_true",
+        help="Resume by actually launching agy instead of printing the resume command."
+    )
+    parser.add_argument(
+        "--view",
+        metavar="LIST",
+        default=None,
+        help="With --preview: comma list of extras to show ('tools', 'replies'; '' = prompts only). Overrides the saved view."
+    )
+    parser.add_argument(
+        "--toggle-view",
+        choices=["tools", "replies"],
+        default=None,
+        help=argparse.SUPPRESS  # Internal: used by fzf key bindings
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Use the built-in Rich split-pane TUI instead of the fzf-based browser."
+    )
+    # Internal: fzf key-binding callbacks (see fzf_ui.py)
+    parser.add_argument("--fzf-key", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--state", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--sel", default="", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
+    # 0a. Flip a preview switch (fzf key binding) and exit
+    if args.toggle_view:
+        toggle_preview_view(args.toggle_view)
+        return
+
+    # 0b. fzf key-binding callback (modal keys, resume-commands area): prints the fzf action to run, if any.
+    if args.fzf_key:
+        out = fzf_ui.handle_key(make_shell_config(launch=args.launch), args.fzf_key, args.state, args.sel,
+                                copy_id=copy_to_clipboard)
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        return
+
     # 0. Handle Live Preview Flag / Subcommand
     target_preview = args.preview or (args.arg2 if args.conversation == "preview" else None)
+    if target_preview and fzf_ui.is_group(target_preview):
+        # folder row in grouped mode: overview of that workspace folder
+        console.print(Text("\n").join(dir_preview_lines(fzf_ui.decode_group(target_preview))), soft_wrap=True)
+        return
     if target_preview:
         cid = resolve_conversation(target_preview)
         if cid:
@@ -529,9 +638,10 @@ def main():
             row = cur.fetchone()
             conn.close()
             if row:
-                lines = build_conversation_preview_lines(cid, row)
-                for l in lines:
-                    console.print(l)
+                view = parse_preview_view(args.view) if args.view is not None else load_preview_view()
+                lines = build_conversation_preview_lines(cid, row, view=view)
+                # One render call (lines are already wrapped): per-line console.print is ~10x slower on big sessions.
+                console.print(Text("\n").join(lines), soft_wrap=True)
             else:
                 console.print(f"[bold red]Conversation {cid} not found.[/bold red]")
         return
@@ -575,7 +685,7 @@ def main():
 
     # 3. Handle Resume Latest
     if args.resume_last:
-        resume_latest()
+        resume_latest(launch=args.launch)
         return
 
     # 4. Handle List Table
@@ -791,13 +901,15 @@ def main():
         if re.match(r"^[0-9a-fA-F\-]{6,}$", args.conversation):
             target_cid = resolve_conversation(args.conversation)
             if target_cid:
-                resume_conversation(target_cid)
+                resume_conversation(target_cid, launch=args.launch)
                 return
 
-    # 10. Default Launch: Master Interactive Chats TUI
-    if args.fzf and shutil.which("fzf"):
-        run_fzf_tui(initial_query=args.conversation or "", show_all=args.all)
-        return
+    # 10. Default Launch: the fzf-based browser (claude-chats look) when fzf is available and we have a console;
+    #     --tui (or no fzf / no console) uses the Rich split-pane TUI.
+    if (args.fzf or not args.tui) and shutil.which("fzf") and sys.stdout.isatty():
+        if run_fzf_tui(initial_query=args.conversation or "", show_all=args.all, launch=args.launch,
+                       limit=args.limit, group=args.group):
+            return
 
     initial_q = args.conversation or ""
     app = MainChatsTUI(
@@ -805,7 +917,8 @@ def main():
         initial_query=initial_q,
         default_action="resume",
         limit=args.limit,
-        group_by_dir=args.group
+        group_by_dir=args.group,
+        launch=args.launch
     )
     app.run()
 

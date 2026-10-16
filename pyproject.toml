@@ -25,6 +25,9 @@ classifiers = [
     "Environment :: Console",
 ]
 
+[tool.setuptools]
+py-modules = ["agy_chats", "session_engine", "tui", "fzf_ui"]
+
 [project.scripts]
 agy-chats = "agy_chats:main"
 agy-fork = "agy_chats:main"

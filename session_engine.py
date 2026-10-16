@@ -12,12 +12,60 @@ import shutil
 import subprocess
 import json
 import re
+import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any
 
 DEFAULT_CONV_DIR = os.path.expanduser("~/.gemini/antigravity-cli/conversations")
 DEFAULT_BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity-cli/brain")
 DEFAULT_SUMMARIES_DB = os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+PREVIEW_VIEW_FILE = os.path.expanduser("~/.agy_chats_preview_view")
+
+
+# ==============================================================================
+# Preview View State (which extras the preview pane shows; prompts are always on)
+# ==============================================================================
+
+PREVIEW_VIEW_KEYS = ("tools", "replies")
+_PREVIEW_VIEW_DEFAULT = {"tools": True, "replies": False}
+
+
+def parse_preview_view(spec: str) -> Dict[str, bool]:
+    """Parses a comma list like 'tools,replies' (empty string = prompts only)."""
+    wanted = {p.strip().lower() for p in (spec or "").split(",") if p.strip()}
+    return {k: (k in wanted) for k in PREVIEW_VIEW_KEYS}
+
+
+def load_preview_view() -> Dict[str, bool]:
+    """Loads the persisted preview view; falls back to defaults if missing or corrupt."""
+    view = dict(_PREVIEW_VIEW_DEFAULT)
+    try:
+        with open(PREVIEW_VIEW_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in PREVIEW_VIEW_KEYS:
+            if isinstance(data.get(k), bool):
+                view[k] = data[k]
+    except Exception:
+        pass
+    return view
+
+
+def toggle_preview_view(key: str) -> Dict[str, bool]:
+    """Flips one preview switch ('tools' or 'replies'), persists, and returns the new view."""
+    view = load_preview_view()
+    if key in PREVIEW_VIEW_KEYS:
+        view[key] = not view[key]
+        try:
+            with open(PREVIEW_VIEW_FILE, "w", encoding="utf-8") as f:
+                json.dump(view, f)
+        except Exception:
+            pass
+    return view
+
+
+def build_resume_cmd(cid: str) -> str:
+    """The shell command that resumes an Antigravity conversation."""
+    return f"agy --conversation {cid}"
 
 
 # ==============================================================================
@@ -138,7 +186,9 @@ def format_tool_display(tool_name: str, args: Dict[str, Any]) -> Tuple[str, str,
         return ui_name, f"Schedule({cron})", f"Schedule({cron})"
     else:
         ui_name = tool_name
-        return ui_name, f"{tool_name}()", f"{tool_name}()"
+        hint = str(args.get("toolSummary") or args.get("toolAction") or "").replace("\r", " ").replace("\n", " ").strip()
+        short_hint = (hint[:47] + "...") if len(hint) > 50 else hint
+        return ui_name, f"{tool_name}({short_hint})", f"{tool_name}({hint})"
 
 
 def extract_tool_info(payload: bytes) -> Optional[Dict[str, Any]]:
@@ -286,6 +336,7 @@ class SessionReader:
                     "assistant_text": "",
                     "tool_count": 0,
                     "tools": [],
+                    "events": [],  # chronological ("reply", text) / ("tool", tinfo)
                     "step_types": [step_type]
                 }
             else:
@@ -307,11 +358,15 @@ class SessionReader:
                         tinfo["tool_number"] = len(current_turn["tools"]) + 1
                         current_turn["tools"].append(tinfo)
                         current_turn["tool_count"] = len(current_turn["tools"])
-                    elif step_type == 15 and not current_turn["assistant_text"]:
+                        current_turn["events"].append(("tool", tinfo))
+                    elif step_type == 15:
                         details = extract_step_details(payload)
                         agent_text = details.get("agent_text") or ""
                         if agent_text:
-                            current_turn["assistant_text"] = agent_text
+                            if not current_turn["assistant_text"]:
+                                current_turn["assistant_text"] = agent_text  # raw, as before (fork/tool UIs rely on it)
+                            if agent_text.strip():
+                                current_turn["events"].append(("reply", agent_text.strip()))
 
         if current_turn:
             turns.append(current_turn)
@@ -533,7 +588,7 @@ def format_workspace_path(ws_uris: Optional[str]) -> str:
         paths = []
         home = os.path.expanduser("~").replace("\\", "/")
         for u in uris:
-            p = u.replace("file://", "")
+            p = urllib.parse.unquote(u.replace("file://", ""))   # some URIs arrive as /e%3A/JB
             if sys.platform == "win32" and p.startswith("/"):
                 if len(p) >= 3 and p[2] == ":":
                     p = p[1:]
